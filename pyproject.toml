@@ -1,0 +1,11 @@
+# 只用于开发工具（ruff、pytest）；宿主装载插件时不读这个文件。
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"

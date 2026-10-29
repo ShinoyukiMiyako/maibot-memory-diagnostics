@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+# 宿主首次加载时在插件目录生成，属于部署方的本地配置
+config.toml
