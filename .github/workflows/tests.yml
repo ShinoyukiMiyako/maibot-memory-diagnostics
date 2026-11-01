@@ -1,0 +1,33 @@
+name: tests
+
+on:
+  push:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-15-intel]
+        sdk: ["maibot-plugin-sdk"]
+        include:
+          # 清单声明的最低 SDK；SDK 的行为与平台无关，一个平台验证即可。
+          - os: ubuntu-latest
+            sdk: "maibot-plugin-sdk==2.8.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          # 两版宿主都要求 Python 3.12 及以上。
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install pytest ruff "${{ matrix.sdk }}"
+      - name: Ruff
+        run: python -m ruff check .
+      - name: Pytest
+        run: python -m pytest -q -rs

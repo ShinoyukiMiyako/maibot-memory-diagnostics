@@ -84,9 +84,11 @@ def test_dir_stats_counts_matching_files_only(tmp_path):
     assert dir_stats(tmp_path / "missing", "*") is None
 
 
-SUPPORTED = pytest.mark.skipif(not (sys.platform == "win32" or sys.platform.startswith("linux")), reason="需要 Linux 或 Windows")
+SUPPORTED = pytest.mark.skipif(not (sys.platform in ("win32", "darwin") or sys.platform.startswith("linux")),
+                               reason="需要 Linux、Windows 或 macOS")
 LINUX_ONLY = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="只在 Linux 上有意义")
 WINDOWS_ONLY = pytest.mark.skipif(sys.platform != "win32", reason="只在 Windows 上有意义")
+DARWIN_ONLY = pytest.mark.skipif(sys.platform != "darwin", reason="只在 macOS 上有意义")
 
 
 def make_targets(tmp_path, **overrides):
@@ -98,7 +100,7 @@ def make_targets(tmp_path, **overrides):
 
 
 def as_runner_child(monkeypatch):
-    # Linux 上 check_worker 还会比对 getppid；让测试进程扮演“自己的 Runner”，被测的 Worker 就是测试进程本身。
+    # Linux 与 macOS 上 check_worker 还会比对 getppid；让测试进程扮演“自己的 Runner”，被测的 Worker 就是测试进程本身。
     monkeypatch.setattr(collector.os, "getppid", lambda: os.getpid())
 
 
@@ -254,9 +256,9 @@ def test_check_worker_converts_unreadable_worker_into_worker_gone(tmp_path, monk
 
 
 @SUPPORTED
-def test_check_worker_detects_reparenting_on_linux(tmp_path, monkeypatch):
-    if not collector.IS_LINUX:
-        pytest.skip("只有 Linux 按父进程号判断 Worker 退出")
+def test_check_worker_detects_reparenting(tmp_path, monkeypatch):
+    if collector.IS_WINDOWS:
+        pytest.skip("Windows 不给孤儿进程改父进程号")
     monkeypatch.setattr(collector.os, "getppid", lambda: 1)
     with pytest.raises(WorkerGone):
         Collector(make_targets(tmp_path, worker_identity=identity_of(os.getpid()))).check_worker()
@@ -299,7 +301,7 @@ def test_fast_and_trend_on_current_process_produce_consistent_records(tmp_path, 
         assert trend["cgroup"]["version"] in (1, 2, None)
     else:
         assert not linux_keys & set(trend)
-        assert first["worker"]["handles"] > 0
+        assert first["worker"]["threads" if collector.IS_DARWIN else "handles"] > 0
 
 
 @LINUX_ONLY
@@ -337,3 +339,112 @@ def test_fast_windows_aggregates_children_by_exe(tmp_path, monkeypatch):
     sample = sampler.fast()
     assert sample["worker"] == {"rss": 1000, "primary": 800, "hwm": 2000, "handles": 5}
     assert sample["children"] == {"node.exe": {"n": 2, "rss": 40, "anon": 25}}
+
+
+# ---- 用替身 darwinproc 测 macOS 的分支（任何平台都能跑） -----------------------------
+
+
+class FakeDarwinproc:
+    def __init__(self):
+        self.memory = {
+            100: {"resident": 1000, "footprint": 800, "peak_footprint": 2000},
+            11: {"resident": 30, "footprint": 20},
+            12: {"resident": 10, "footprint": 5},
+            os.getpid(): {"resident": 50, "footprint": 40},
+        }
+        self.children = {11: "Node", 12: "node", 13: "gone", 14: "root-owned"}
+        self.failures = {13: ProcessLookupError(3, "No such process"), 14: PermissionError(1, "Operation not permitted")}
+        self.threads_failure = None
+
+    def process_memory(self, pid):
+        if pid in self.failures:
+            raise self.failures[pid]
+        return self.memory[pid]
+
+    def process_threads(self, pid):
+        if self.threads_failure is not None:
+            raise self.threads_failure
+        return 7
+
+    def descendants(self, pid):
+        return self.children
+
+    def process_created(self, pid):
+        return 123456
+
+    def find_worker_pid(self):
+        return 100
+
+
+@pytest.fixture
+def darwin(tmp_path, monkeypatch):
+    monkeypatch.setattr(collector, "IS_LINUX", False)
+    monkeypatch.setattr(collector, "IS_WINDOWS", False)
+    monkeypatch.setattr(collector, "IS_DARWIN", True)
+    fake = FakeDarwinproc()
+    monkeypatch.setattr(collector, "darwinproc", fake, raising=False)
+    sampler = Collector(make_targets(tmp_path, worker_pid=100))
+    monkeypatch.setattr(sampler, "check_worker", lambda: None)
+    return sampler, fake
+
+
+def test_fast_darwin_aggregates_children_by_name(darwin):
+    sampler, _ = darwin
+    sample = sampler.fast()
+    assert sample["worker"] == {"rss": 1000, "primary": 800, "hwm": 2000, "threads": 7}
+    # 退出的与无权读取的子进程都不计入，不让一轮采样失败。
+    assert sample["children"] == {"node": {"n": 2, "rss": 40, "anon": 25}}
+    assert sample["self"] == {"rss": 50, "anon": 40}
+    assert "webui" not in sample
+
+
+def test_fast_darwin_treats_a_vanished_worker_as_gone(darwin):
+    sampler, fake = darwin
+    fake.failures[100] = ProcessLookupError(3, "No such process")
+    with pytest.raises(WorkerGone):
+        sampler.fast()
+    del fake.failures[100]
+    fake.threads_failure = ProcessLookupError(3, "No such process")
+    with pytest.raises(WorkerGone):
+        sampler.fast()
+
+
+def test_fast_darwin_does_not_hide_other_worker_failures(darwin):
+    # 读不了 Worker 不等于 Worker 退出了：要算采样失败，不能悄悄结束采集。
+    sampler, fake = darwin
+    fake.failures[100] = PermissionError(1, "Operation not permitted")
+    with pytest.raises(PermissionError):
+        sampler.fast()
+
+
+def test_identity_and_worker_lookup_use_darwinproc(darwin):
+    assert identity_of(100) == (100, 123456)
+    assert collector.find_worker() == (100, (100, 123456))
+
+
+def test_check_worker_compares_the_parent_on_darwin(tmp_path, monkeypatch, darwin):
+    monkeypatch.setattr(collector.os, "getppid", lambda: 1)
+    with pytest.raises(WorkerGone):
+        Collector(make_targets(tmp_path, worker_pid=100, worker_identity=(100, 123456))).check_worker()
+    monkeypatch.setattr(collector.os, "getppid", lambda: 100)
+    Collector(make_targets(tmp_path, worker_pid=100, worker_identity=(100, 123456))).check_worker()
+
+
+@SUPPORTED
+def test_primary_label_names_the_metric_of_this_platform():
+    expected = {"linux": "匿名内存", "win32": "提交内存", "darwin": "物理占用"}[sys.platform]
+    assert collector.PRIMARY_LABEL == expected
+
+
+def test_unsupported_platform_is_refused(monkeypatch):
+    for flag in ("IS_LINUX", "IS_WINDOWS", "IS_DARWIN"):
+        monkeypatch.setattr(collector, flag, False)
+    with pytest.raises(NotImplementedError):
+        collector.ensure_supported_platform()
+
+
+@DARWIN_ONLY
+def test_meta_records_the_macos_release(tmp_path):
+    record = Collector(make_targets(tmp_path, worker_identity=identity_of(os.getpid()))).meta({})
+    assert record["kernel"] and record["macos"]
+    assert "worker_env" not in record and "cgroup" not in record

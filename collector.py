@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import os
+import platform
 import sqlite3
 import sys
 import time
@@ -20,9 +21,14 @@ from . import procfs
 
 IS_LINUX = sys.platform.startswith("linux")
 IS_WINDOWS = sys.platform == "win32"
+IS_DARWIN = sys.platform == "darwin"
 # 宿主卸载或重载插件时会把插件目录下的模块从 sys.modules 清掉，函数内的相对导入届时会失败，所以只在模块顶层导入。
 if IS_WINDOWS:
     from . import winproc
+if IS_DARWIN:
+    from . import darwinproc
+# 主指标在各平台是不同的量，摘要要如实写名字。
+PRIMARY_LABEL = "匿名内存" if IS_LINUX else "提交内存" if IS_WINDOWS else "物理占用"
 
 # 只从 Worker 的环境里取与分配器有关的键；Runner 与 Worker 的环境里有会话令牌，不能整份记录。
 WORKER_ENV_WHITELIST = ("MALLOC_ARENA_MAX", "GLIBC_TUNABLES", "MALLOC_TRIM_THRESHOLD_", "MALLOC_MMAP_THRESHOLD_",
@@ -48,7 +54,7 @@ class Targets:
 
 @dataclass
 class Window:
-    """一个趋势窗口内 Worker 主指标的极值，主指标在 Linux 是 RssAnon，Windows 是 PrivateUsage。"""
+    """一个趋势窗口内 Worker 主指标的极值，主指标在 Linux 是 RssAnon，Windows 是 PrivateUsage，macOS 是 phys_footprint。"""
 
     count: int = 0
     primary_min: Optional[int] = None
@@ -95,21 +101,28 @@ class Window:
 
 
 def ensure_supported_platform() -> None:
-    if not (IS_LINUX or IS_WINDOWS):
-        raise NotImplementedError(f"内存诊断插件只支持 Linux 与 Windows，当前平台 {sys.platform}")
+    if not (IS_LINUX or IS_WINDOWS or IS_DARWIN):
+        raise NotImplementedError(f"内存诊断插件只支持 Linux、Windows 与 macOS，当前平台 {sys.platform}")
 
 
 def identity_of(pid: int) -> Tuple[Any, ...]:
-    """(pid, 启动时间)：Linux 是 stat 的 starttime，Windows 是创建时间。会原样写进每条记录，不含路径。"""
+    """(pid, 启动时间)：Linux 是 stat 的 starttime，Windows 与 macOS 是创建时间。会原样写进每条记录，不含路径。"""
     ensure_supported_platform()
     if IS_LINUX:
         return (pid, procfs.process_identity(pid)[1])
-    return (pid, winproc.process_created(pid))
+    if IS_WINDOWS:
+        return (pid, winproc.process_created(pid))
+    return (pid, darwinproc.process_created(pid))
 
 
 def find_worker() -> Tuple[int, Tuple[Any, ...]]:
     ensure_supported_platform()
-    pid = procfs.find_worker_pid() if IS_LINUX else winproc.find_worker_pid()
+    if IS_LINUX:
+        pid = procfs.find_worker_pid()
+    elif IS_WINDOWS:
+        pid = winproc.find_worker_pid()
+    else:
+        pid = darwinproc.find_worker_pid()
     return pid, identity_of(pid)
 
 
@@ -120,8 +133,8 @@ class Collector:
 
     def check_worker(self) -> None:
         pid = self.targets.worker_pid
-        # Worker 被杀后 Runner 不会自行退出（宿主断连不结束 Runner），Linux 上会被收养，父进程号随之改变。
-        if IS_LINUX and os.getppid() != pid:
+        # Worker 被杀后 Runner 不会自行退出（宿主断连不结束 Runner），Linux 与 macOS 上会被收养，父进程号随之改变。
+        if not IS_WINDOWS and os.getppid() != pid:
             raise WorkerGone(f"父进程已从 Worker pid={pid} 变为 {os.getppid()}，Worker 已退出")
         try:
             current = identity_of(pid)
@@ -136,7 +149,12 @@ class Collector:
         """先确认 Worker 还在，再读进程外的内存。不碰 Worker 主循环：主循环卡住时这一步照样能采。"""
         self.check_worker()
         sample: Dict[str, Any] = {"t": round(time.time(), 3), "k": "fast"}
-        sample.update(self._fast_linux() if IS_LINUX else self._fast_windows())
+        if IS_LINUX:
+            sample.update(self._fast_linux())
+        elif IS_WINDOWS:
+            sample.update(self._fast_windows())
+        else:
+            sample.update(self._fast_darwin())
         return sample
 
     def commit_fast(self, sample: Dict[str, Any]) -> None:
@@ -210,6 +228,35 @@ class Collector:
         # Windows 取不到 TCP 发送队列长度，不记 webui。
         return {"worker": worker, "children": children, "self": {"rss": own["working_set"], "anon": own["private_usage"]}}
 
+    def _fast_darwin(self) -> Dict[str, Any]:
+        pid = self.targets.worker_pid
+        try:
+            memory = darwinproc.process_memory(pid)
+            # 放在内存之后：僵尸进程的内存读数不报错、数值是残留的，线程数才会报 ESRCH，这条样本不能写进去。
+            threads = darwinproc.process_threads(pid)
+        except ProcessLookupError as exc:
+            raise WorkerGone(f"Worker pid={pid} 正在退出: {exc}") from exc
+        worker = {
+            "rss": memory["resident"],
+            "primary": memory["footprint"],
+            "hwm": memory["peak_footprint"],
+            "threads": threads,
+        }
+        children: Dict[str, Dict[str, int]] = {}
+        for child_pid, exe in darwinproc.descendants(pid).items():
+            try:
+                child = darwinproc.process_memory(child_pid)
+            except OSError:
+                # 子进程在列举之后退出，或是无权读取的进程。
+                continue
+            bucket = children.setdefault(exe.lower(), {"n": 0, "rss": 0, "anon": 0})
+            bucket["n"] += 1
+            bucket["rss"] += child["resident"]
+            bucket["anon"] += child["footprint"]
+        own = darwinproc.process_memory(os.getpid())
+        # 不记 webui：要逐个 socket 读另一个进程的发送队列，先做与 Windows 相同的子集。
+        return {"worker": worker, "children": children, "self": {"rss": own["resident"], "anon": own["footprint"]}}
+
     # -- 趋势记录 ---------------------------------------------------------
 
     def trend(self) -> Dict[str, Any]:
@@ -263,6 +310,9 @@ class Collector:
                 (procfs.PROC / str(self.targets.worker_pid) / "environ").read_bytes(), WORKER_ENV_WHITELIST
             )
             record["cgroup"] = procfs.cgroup_memory(self.targets.worker_pid)
+        if IS_DARWIN:
+            record["kernel"] = os.uname().release
+            record["macos"] = platform.mac_ver()[0]
         record.update(extra)
         return record
 

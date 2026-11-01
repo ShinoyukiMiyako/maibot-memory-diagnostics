@@ -1,7 +1,7 @@
 """内存诊断插件入口。
 
 插件运行在宿主拉起的插件 Runner 子进程里，碰不到 Worker 的 Python 堆，只能从进程外周期采集：
-Worker 及其子进程的内存（/proc 或 Windows API）、cgroup、WebUI 端口的 TCP 发送队列、主库只读统计与关键文件大小，
+Worker 及其子进程的内存（/proc、Windows API 或 libproc）、cgroup、WebUI 端口的 TCP 发送队列、主库只读统计与关键文件大小，
 写成 JSONL 放在插件数据目录；/memdiag 回复摘要，/memdiag pack 把样本打成诊断包。
 
 模块顶层与 __init__ 不做 I/O、不起任务：两版宿主在插件禁用或做配置检查时也会执行它们。
@@ -25,7 +25,7 @@ import traceback
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
 
 from . import dbstats, report, storage
-from .collector import IS_LINUX, Collector, Targets, WorkerGone, ensure_supported_platform, find_worker
+from .collector import PRIMARY_LABEL, Collector, Targets, WorkerGone, ensure_supported_platform, find_worker
 
 PLUGIN_VERSION = "0.1.0"
 FAST_STEM = "fast"
@@ -636,7 +636,7 @@ class MemDiagPlugin(MaiBotPlugin):
             last_trend=self._last_trend,
             db_light=self._db_light,
             db_heavy=self._db_heavy,
-            primary_label="匿名内存" if IS_LINUX else "提交内存",
+            primary_label=PRIMARY_LABEL,
             worker_pid=targets.worker_pid,
             collector_state=state,
             sampled_seconds=ended - self._started_mono,

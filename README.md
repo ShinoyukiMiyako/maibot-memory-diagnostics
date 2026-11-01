@@ -4,7 +4,7 @@
 出事后把诊断包交给维护者或自己分析。
 
 插件运行在宿主拉起的插件 Runner 子进程里，看不到 Worker（真正跑聊天逻辑的进程）的 Python 堆，
-所以它只做进程外的观测：读 `/proc`（Linux）或 Windows 进程 API、cgroup、WebUI 端口的 TCP 发送队列、
+所以它只做进程外的观测：读 `/proc`（Linux）、Windows 进程 API 或 macOS 的 libproc、cgroup、WebUI 端口的 TCP 发送队列、
 主库的只读统计和几个已知会变大的文件。它回答的是“哪一类内存在涨、和什么同步涨”，
 不回答“是哪个 Python 对象在涨”；后者需要宿主自带的进程内诊断（v1.3.13 起的 `logs/memory_diagnostics`）
 或 memray / tracemalloc 这类工具。
@@ -19,7 +19,11 @@
 | maibot-plugin-sdk | 2.8.0 及以上 |
 | Linux | 全部功能；4.5 之前的内核从 `statm` 推算匿名内存，4.14 之前的内核没有 `smaps_rollup`（记为 `null`） |
 | Windows | 进程内存、子进程、文件大小、数据库统计照常；没有 smaps、glibc 堆估计、cgroup、fd、线程数、正在退出的进程数与全部 WebUI 连接信息，另记句柄数 `handles` |
-| macOS 及其他 | 不支持，插件加载时直接报错 |
+| macOS | 进程内存（主指标是物理占用 `phys_footprint`，峰值也按它算）、线程数、子进程、文件大小、数据库统计照常；没有 smaps、glibc 堆估计、cgroup、fd、正在退出的进程数与全部 WebUI 连接信息 |
+| 其他 | 不支持，插件加载时直接报错 |
+
+真实宿主上的端到端验证只在 Linux 上做过。Windows 与 macOS 上跑过采集代码的全部测试（macOS 为 GitHub Actions 的
+arm64 与 Intel 机器，读的是真实进程），没有在真实宿主里运行过。
 
 ## 安装
 
@@ -67,7 +71,7 @@
 
 | 档位 | 默认间隔 | 内容 |
 | --- | --- | --- |
-| 快速样本 `fast` | 15 秒 | Worker 的 RSS、匿名内存（Windows 为提交内存）、峰值、线程数（Windows 为句柄数）；按可执行文件名汇总的子进程内存（插件 Runner、Chromium、Node 等，另计正在退出的进程数）；Runner 自身内存；WebUI 端口上 Worker 的连接数、发送队列、疑似停止读取的连接数；一次到 Worker 的 RPC 往返耗时 |
+| 快速样本 `fast` | 15 秒 | Worker 的 RSS、匿名内存（Windows 为提交内存，macOS 为物理占用）、峰值、线程数（Windows 为句柄数）；按可执行文件名汇总的子进程内存（插件 Runner、Chromium、Node 等，另计正在退出的进程数）；Runner 自身内存；WebUI 端口上 Worker 的连接数、发送队列、疑似停止读取的连接数；一次到 Worker 的 RPC 往返耗时 |
 | 趋势记录 `trend` | 5 分钟 | 自上一条趋势记录以来快速样本的最小/最大/末值（上一轮没写成时并进这一条，`window.samples` 相应变多）；`smaps_rollup`；glibc 线程堆估计；fd 分类与主库、元数据库的打开数；cgroup 用量、上限与 OOM 计数；逐条 WebUI 连接；关键文件与目录大小；主库轻量统计（页数、各表最大 id、新增消息数） |
 | 数据库总量 `db` | 1 小时 | 消息总数、图片按类型计数、黑话证据体量、近 30 天消息量（小时聚合表加未聚合尾部的近似值） |
 
@@ -77,7 +81,8 @@
 每次开始采集时还会写一条 `meta`：平台、Python 与 SQLite 版本、宿主版本、插件配置（白名单只记条目数）。
 Linux 上另有内核与 glibc 版本、cgroup、Worker 环境里与分配器有关的变量（`worker_env`，只取 `MALLOC_ARENA_MAX`、
 `MALLOC_TRIM_THRESHOLD_`、`MALLOC_MMAP_THRESHOLD_`、`MALLOC_TOP_PAD_`、`MALLOC_MMAP_MAX_`、`GLIBC_TUNABLES`、`PYTHONMALLOC`
-这几个键，其他变量不记）；Windows 不读 Worker 的环境，`worker_env` 这个键不存在，不代表这些变量没设置。
+这几个键，其他变量不记）；macOS 上另有内核与系统版本。Windows 与 macOS 不读 Worker 的环境，`worker_env` 这个键不存在，
+不代表这些变量没设置。
 
 内存采样不经过 Worker：每轮先读进程外的数据，再做一次 RPC 探测，然后写盘。探测最多等 5 秒（快速间隔不足 10 秒时等半个间隔），
 所以 Worker 主循环卡住时样本不会断，只是每条样本晚这么一会儿落盘。探测没有及时返回就记 `rpc_pending_s`
@@ -135,8 +140,8 @@ Windows 上样本文件正被别的程序打开（例如正在打包，或 `Get-
 
 ## 怎么看
 
-主指标是 Linux 的匿名内存（`RssAnon`），Windows 的提交内存（private usage）。它比 RSS 更接近
-“程序真正占着不放的内存”，不受页缓存与共享库影响。
+主指标是 Linux 的匿名内存（`RssAnon`）、Windows 的提交内存（private usage）、macOS 的物理占用（`phys_footprint`）。
+它比 RSS 更接近“程序真正占着不放的内存”，不受页缓存与共享库影响。三个平台的量不同，不要跨平台比数值，只看走势。
 
 - 主指标按天近似线性上涨、不回落：Worker 里有东西在持续累积。对照同期的消息量、文件大小、
   连接数，看它和哪个量同步。
@@ -183,7 +188,8 @@ python -m pytest
 ```
 
 `tests/test_plugin.py` 需要安装 `maibot-plugin-sdk`，没有时自动跳过；其余测试只依赖标准库与 pytest。
-Windows 专属的测试在 Linux 上跳过，反之亦然。
+平台专属的测试在别的平台上跳过；macOS 上有 `cc` 时，`tests/test_darwinproc.py` 会对照系统头文件校验结构体布局。
+CI 在 Linux、Windows 与 macOS（arm64、Intel）上跑。
 
 ## 许可证
 

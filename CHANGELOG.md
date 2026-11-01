@@ -5,8 +5,8 @@
 首个版本。
 
 - 从插件 Runner 进程外周期采集 Worker 内存：Linux 读 `/proc`，Windows 用进程 API（启动器式 venv、
-  解释器副本式 venv 与系统 Python 都能认出 Worker）；子进程按可执行文件名汇总，只在 Worker 的直接子进程上
-  认插件 Runner，不从命令行取任何文本。
+  解释器副本式 venv 与系统 Python 都能认出 Worker），macOS 用 libproc（主指标是 `phys_footprint`）；
+  子进程按可执行文件名汇总，只在 Linux 上按 Worker 的直接子进程认插件 Runner，不从命令行取任何文本。
 - 趋势记录：`smaps_rollup`、glibc 线程堆估计、fd 分类、cgroup v1/v2 用量与 OOM 计数（按 `mountinfo` 找挂载点，
   叠层挂载取可见的一层）、关键文件与目录大小。一轮没写成时窗口并进下一条记录。
 - WebUI 端口按 socket inode 归属到 Worker 的连接与发送队列，识别零窗口探测中的停读客户端。
@@ -23,3 +23,4 @@
 - `/memdiag` 回复摘要，`/memdiag pack` 在后台生成诊断包，旧包删不掉时新包照常生成并在回复里注明；
   命令需要宿主放行（受保护命令），可再按用户收窄。
 - 兼容 MaiBot 1.2.3 至 1.3.x、maibot-plugin-sdk 2.8.0 及以上；Linux 内核 4.5 之前从 `statm` 推算匿名内存。
+  真实宿主的端到端验证只在 Linux 上做过，Windows 与 macOS 只验证过采集代码。

@@ -22,8 +22,8 @@ pytestmark = pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:Use
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 MODULE_NAME = "_maibot_plugin_shinoyuki_memdiag"
-SUPPORTED = sys.platform == "win32" or sys.platform.startswith("linux")
-needs_platform = pytest.mark.skipif(not SUPPORTED, reason="需要 Linux 或 Windows")
+SUPPORTED = sys.platform in ("win32", "darwin") or sys.platform.startswith("linux")
+needs_platform = pytest.mark.skipif(not SUPPORTED, reason="需要 Linux、Windows 或 macOS")
 
 
 def load_plugin_module():
