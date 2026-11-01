@@ -29,7 +29,7 @@ MaiBot 运行几天到几十天后内存一路上涨、被 OOM 杀掉或被容�
    | 直接运行 | `<实例根>/data/plugins/shinoyuki.memdiag/packs/` |
 
    Docker 下回复里的路径 `data/plugins/...` 是容器内路径，到宿主机上按上表找。WebUI 下载不了诊断包。
-6. 到本仓库的 Issues 选“内存问题反馈”，把诊断包拖进去，写明运行了多久、内存涨到多少。
+6. [联系开发者](https://github.com/ShinoyukiMiyako)，把诊断包发过去，写明运行了多久、内存涨到多少。
 
    Docker 部署再附上重启次数，OOM 后容器恢复运行时 `OOMKilled` 会变回 `false`，这个数不会：
 
@@ -37,7 +37,7 @@ MaiBot 运行几天到几十天后内存一路上涨、被 OOM 杀掉或被容�
    docker inspect --format '{{.RestartCount}}' maim-bot-core
    ```
 
-Issue 是公开的。诊断包里是内存读数、文件大小、各表行数与消息量、版本信息和本插件配置，以及 v1.3.13 起宿主自带的
+诊断包里是内存读数、文件大小、各表行数与消息量、版本信息和本插件配置，以及 v1.3.13 起宿主自带的
 内存诊断日志；没有聊天内容、API Key、客户端 IP 和宿主配置文件的内容，宿主配置只记 WebUI 端口号这类数值。
 `cgroup.path` 可能带容器 ID 或 systemd 单元名。里面都是 JSON 文本，可以解压看过再发。
 
