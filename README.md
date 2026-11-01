@@ -18,7 +18,7 @@
 | MaiBot 宿主 | 1.2.3 至 1.3.x |
 | maibot-plugin-sdk | 2.8.0 及以上 |
 | Linux | 全部功能；4.5 之前的内核从 `statm` 推算匿名内存，4.14 之前的内核没有 `smaps_rollup`（记为 `null`） |
-| Windows | 进程内存、子进程、文件大小、数据库统计照常；没有 smaps、glibc 堆估计、cgroup、fd 与 WebUI 发送队列 |
+| Windows | 进程内存、子进程、文件大小、数据库统计照常；没有 smaps、glibc 堆估计、cgroup、fd、线程数、正在退出的进程数与全部 WebUI 连接信息，另记句柄数 `handles` |
 | macOS 及其他 | 不支持，插件加载时直接报错 |
 
 ## 安装
@@ -33,8 +33,8 @@
 `/memdiag` 是宿主意义上的受保护（operator）命令，宿主按下面任一条放行：
 
 - 宿主自带的本地操作员终端（`bot_console` 平台）始终可用。
-- 只放行本命令（推荐）：在 WebUI 的“命令权限”页为 `shinoyuki.memdiag.memdiag` 放行用户，
-  或在 MaiBot 的 `bot_config.toml` 里写：
+- 只放行本命令（推荐）：在 WebUI“麦麦设置”页的“命令管理”标签里选 `/memdiag`（插件 `shinoyuki.memdiag`，可搜 `memdiag`），
+  填写“仅为此命令放行用户”；或在 MaiBot 的 `bot_config.toml` 里写：
 
   ```toml
   [plugin.command_permissions."shinoyuki.memdiag.memdiag"]
@@ -42,15 +42,15 @@
   ```
 
   同一处还有 `allow_chats`（聊天流 ID）。放行聊天后，该聊天里的任何人都能执行本命令，包括 `/memdiag pack`。
-- `bot_config.toml` 的 `[plugin].permission`：列在这里的用户还能用聊天命令安装、卸载、重载所有插件，
-  远多于使用本命令所需。
+- `bot_config.toml` 的 `[plugin].permission`：列在这里的用户能执行所有受保护命令，包括用 `/pm` 加载、重载插件，
+  读取和修改任意插件配置（含本插件的 `[command].allowed_users`），以及用 `/offline` 关闭全部适配器，远多于使用本命令所需。
 
 想在宿主放行之上再收窄（例如放行了整个群），可以在本插件的 `config.toml` 里设置
 `[command].allowed_users = ["qq:123456789"]`；留空表示不再收窄。条目格式是 `平台:用户ID`，
 平台不区分大小写，用户 ID 区分大小写；格式不对的条目会让命令直接报错，而不是被悄悄忽略。
 
-1.2.3 的宿主把 `permission` 与 `allow_users` 的整条条目转成小写再比对，用户 ID 含大写字母
-（例如部分平台的 openid）时在 1.2.3 上放行不了；1.3.x 已改为只把平台转小写。
+1.2.5 之前的宿主把 `permission` 与 `allow_users` 的整条条目转成小写再比对，用户 ID 含大写字母
+（例如部分平台的 openid）时放行不了；1.2.5 起只把平台转小写。
 
 ## 命令
 
@@ -67,26 +67,30 @@
 
 | 档位 | 默认间隔 | 内容 |
 | --- | --- | --- |
-| 快速样本 `fast` | 15 秒 | Worker 的 RSS、匿名内存（Windows 为提交内存）、峰值、线程数；按可执行文件名汇总的子进程内存（插件 Runner、Chromium、Node 等，另计正在退出的进程数）；Runner 自身内存；WebUI 端口上 Worker 的连接数、发送队列、疑似停止读取的连接数；一次到 Worker 的 RPC 往返耗时 |
+| 快速样本 `fast` | 15 秒 | Worker 的 RSS、匿名内存（Windows 为提交内存）、峰值、线程数（Windows 为句柄数）；按可执行文件名汇总的子进程内存（插件 Runner、Chromium、Node 等，另计正在退出的进程数）；Runner 自身内存；WebUI 端口上 Worker 的连接数、发送队列、疑似停止读取的连接数；一次到 Worker 的 RPC 往返耗时 |
 | 趋势记录 `trend` | 5 分钟 | 自上一条趋势记录以来快速样本的最小/最大/末值（上一轮没写成时并进这一条，`window.samples` 相应变多）；`smaps_rollup`；glibc 线程堆估计；fd 分类与主库、元数据库的打开数；cgroup 用量、上限与 OOM 计数；逐条 WebUI 连接；关键文件与目录大小；主库轻量统计（页数、各表最大 id、新增消息数） |
 | 数据库总量 `db` | 1 小时 | 消息总数、图片按类型计数、黑话证据体量、近 30 天消息量（小时聚合表加未聚合尾部的近似值） |
 
 黑话证据体量在 SQLite 3.43 及以后是字节数；更早的 SQLite 没有 `octet_length`，记的是字符数（中文为主时明显小于字节数），
 以 `meta` 里的 `sqlite` 版本为准。
 
-每次开始采集时还会写一条 `meta`：平台、内核、Python、SQLite 与 glibc 版本、宿主版本、Worker 环境里与分配器有关的变量
-（只取 `MALLOC_*`、`GLIBC_TUNABLES`、`PYTHONMALLOC` 这几个键）、cgroup 与插件配置（白名单只记条目数）。
+每次开始采集时还会写一条 `meta`：平台、Python 与 SQLite 版本、宿主版本、插件配置（白名单只记条目数）。
+Linux 上另有内核与 glibc 版本、cgroup、Worker 环境里与分配器有关的变量（`worker_env`，只取 `MALLOC_ARENA_MAX`、
+`MALLOC_TRIM_THRESHOLD_`、`MALLOC_MMAP_THRESHOLD_`、`MALLOC_TOP_PAD_`、`MALLOC_MMAP_MAX_`、`GLIBC_TUNABLES`、`PYTHONMALLOC`
+这几个键，其他变量不记）；Windows 不读 Worker 的环境，`worker_env` 这个键不存在，不代表这些变量没设置。
 
 内存采样不经过 Worker：每轮先读进程外的数据，再做一次 RPC 探测，然后写盘。探测最多等 5 秒（快速间隔不足 10 秒时等半个间隔），
 所以 Worker 主循环卡住时样本不会断，只是每条样本晚这么一会儿落盘。探测没有及时返回就记 `rpc_pending_s`
-（这个请求已等待的秒数），请求不取消，返回后在后面的样本里记下真实耗时；探测失败记 `rpc_error`，不算采样失败。
+（这个请求已等待的秒数），请求不取消，返回后在后面的样本里记下真实耗时，趋势记录的 `rpc_ms_max` 也包含它；
+单个请求最多等 10 分钟，超过后记 `rpc_error` 并重新探测。探测失败记 `rpc_error`，不算采样失败。
 
 cgroup 按 `mountinfo` 找挂载点，兼容 Docker 的私有与共享 cgroup 命名空间。读不到内存用量时
 （memory 控制器未启用，例如树莓派默认内核；或进程位于根 cgroup）记 `unavailable` 与原因。
 
 被观测的文件：
 
-- `logs/expression_review/review_logs.json`（1.2.3）与 `review_logs.jsonl`（之后版本）
+- `logs/expression_review/review_logs.json`（已发布的 1.2.3 至 v1.3.18 都是这个文件）；同目录的 `review_logs.jsonl`
+  留给改成追加写的版本，已发布的版本里恒为 `null`
 - `logs/memory_diagnostics/memory.jsonl`（v1.3.13 起）
 - 统计报告 HTML（`MAIBOT_STATISTICS_REPORT_PATH`，默认 `maibot_statistics.html`）
 - `data/local_store.json`
@@ -119,9 +123,9 @@ cgroup 按 `mountinfo` 找挂载点，兼容 Docker 的私有与共享 cgroup �
 每写一行都 fsync，Worker 被 OOM 杀掉前最后的样本不会丢在缓冲里；磁盘写满或断电留下的半行会被跳过，
 下一条记录另起一行。
 
-Windows 上样本文件正被别的程序打开（例如正在打包，或用 `Get-Content -Wait` 跟着看）时，轮转会失败：
-这一条样本写不进去、记一次采样失败，下一轮从上次停下的地方接着轮转，不会多丢备份；
-一直打不开则按连续失败上限停止采集。
+Windows 上样本文件正被别的程序打开（例如正在打包，或 `Get-Content -Wait` 首次读完整个文件、输出被暂停时；
+它空闲等待时不占用文件）时，轮转会失败：这一条记录（开始采集时写的 `meta` 也一样）写不进去、记一次采样失败，
+下一轮从上次停下的地方接着轮转，不会多丢备份；一直打不开则按连续失败上限停止采集。
 
 打包失败或被停止时会删掉写了一半的 `.partial`；宿主关停超时强杀 Runner 时来不及删，
 留下的残片在之后打包时清理（超过 1 小时的）。旧包被别的程序占着删不掉时，新包照常生成，回复里会注明。
@@ -145,7 +149,7 @@ Windows 上样本文件正被别的程序打开（例如正在打包，或用 `G
   `meta.worker_env` 里可以看到是否设置了 `MALLOC_ARENA_MAX`。
 - 被观测的文件持续变大：宿主若会整份读写这个文件，每次读写的内存峰值会随文件大小一起涨。
 - `rpc_ms` 经常上百毫秒，或频繁出现 `rpc_pending_s`：Worker 主事件循环被阻塞，常与大文件读写、
-  大查询同时出现。
+  大查询同时出现。Worker 卡住超过 10 分钟时要把 `rpc_pending_s` 与 `E_TIMEOUT` 的 `rpc_error` 连起来看。
 - `cgroup.events.oom_kill` 增加：容器或服务的内存上限触发过 OOM。
 
 摘要里的“近 N 小时增长”取的是不晚于 N 小时前的最后一个点。插件重载或 Runner 重启后，
@@ -155,7 +159,9 @@ Windows 上样本文件正被别的程序打开（例如正在打包，或用 `G
 ## 配置
 
 `config.toml` 由宿主根据插件声明生成，可在 WebUI 的插件配置页修改，修改后采集会按新配置重启。
-重启前要先向宿主读几项配置；读不到时（例如 Worker 主循环卡住、RPC 超时）原来的采集照常运行，错误记在日志里。
+重启前要先向宿主读几项配置；读不到时（例如 Worker 主循环卡住、RPC 超时）原来的采集按旧配置照常运行，
+错误记在日志里，`/memdiag` 的摘要也会注明未按新配置重启，下次配置变更或重载时再试。
+`[command].allowed_users` 不依赖采集重启，保存后立即生效。
 
 | 段 | 键 | 默认 | 说明 |
 | --- | --- | --- | --- |

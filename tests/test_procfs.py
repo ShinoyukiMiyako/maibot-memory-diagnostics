@@ -265,7 +265,9 @@ def test_descendants_classifies_processes_without_a_readable_exe_as_unknown(fake
     assert procfs.descendants(100)[0] == {101: "unknown", 102: "unknown"}
 
 
-def test_descendants_skips_a_runner_that_exits_while_its_cmdline_is_read(fake_proc, monkeypatch):
+@pytest.mark.parametrize("gone", [FileNotFoundError(2, "No such file"), ProcessLookupError(3, "No such process")])
+def test_descendants_skips_a_runner_that_exits_while_its_cmdline_is_read(fake_proc, monkeypatch, gone):
+    # 回收发生在打开之前报 ENOENT（窗口横跨整轮 /proc 扫描，更常见），打开之后才回收报 ESRCH。
     fake_proc(100, 1)
     fake_proc(101, 100, cmdline=RUNNER_CMDLINE)
     fake_proc(102, 100)
@@ -273,7 +275,7 @@ def test_descendants_skips_a_runner_that_exits_while_its_cmdline_is_read(fake_pr
 
     def read_bytes(self):
         if self.name == "cmdline" and self.parent.name == "101":
-            raise ProcessLookupError(3, "No such process")
+            raise gone
         return real_read_bytes(self)
 
     monkeypatch.setattr(procfs.Path, "read_bytes", read_bytes)
@@ -440,9 +442,11 @@ def test_cgroup_memory_matches_an_escaped_mount_root(fake_proc, tmp_path):
         "memory.limit_in_bytes": "4294967296\n", "memory.usage_in_bytes": "3\n", "memory.max_usage_in_bytes": "4\n",
         "memory.stat": "", "memory.oom_control": "",
     })
-    scope = "/machine.slice/machine-mai\x2dbot.scope"
+    # systemd 的 scope 名里有字面的反斜杠（\x2d），mountinfo 把反斜杠写成八进制转义，/proc/<pid>/cgroup 不转义。
+    backslash = chr(92)
+    scope = f"/machine.slice/machine-mai{backslash}x2dbot.scope"
     fake_proc(100, 1, cgroup=f"12:memory:{scope}\n",
-              mountinfo=mountinfo_line("cgroup", scope.replace("\\", "\134"), base, "rw,memory"))
+              mountinfo=mountinfo_line("cgroup", scope.replace(backslash, f"{backslash}134"), base, "rw,memory"))
     assert procfs.cgroup_memory(100)["current"] == 3
 
 
@@ -451,3 +455,13 @@ def test_cgroup_memory_reads_the_visible_one_of_stacked_mounts(fake_proc, tmp_pa
     fake_proc(100, 1, cgroup="0::/\n",
               mountinfo=mountinfo_line("cgroup2", "/../..", base, "rw") + mountinfo_line("cgroup2", "/", base, "rw"))
     assert procfs.cgroup_memory(100)["current"] == 9
+
+
+def test_cgroup_memory_v1_reads_the_visible_one_of_stacked_mounts(fake_proc, tmp_path):
+    base = mount_cgroup(tmp_path, {
+        "memory.limit_in_bytes": "4294967296\n", "memory.usage_in_bytes": "7\n", "memory.max_usage_in_bytes": "8\n",
+        "memory.stat": "", "memory.oom_control": "",
+    })
+    fake_proc(100, 1, cgroup="12:memory:/\n",
+              mountinfo=mountinfo_line("cgroup", "/../..", base, "rw,memory") + mountinfo_line("cgroup", "/", base, "rw,memory"))
+    assert procfs.cgroup_memory(100)["current"] == 7

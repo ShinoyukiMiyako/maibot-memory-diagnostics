@@ -36,6 +36,8 @@ STOP_WAIT_SEC = 0.4
 HISTORY_HOURS = 26
 # 每轮最多等 RPC 探测这么久；没回来就不等了，结果留到后面的轮次取。
 PROBE_WAIT_SEC = 5.0
+# 宿主默认 30 秒超时。探测要量的就是长卡顿，超时后重新发请求会把一次卡顿切成几段，趋势里只留下最后一段。
+PROBE_TIMEOUT_MS = 600_000
 
 
 class PluginSection(PluginConfigBase):
@@ -217,6 +219,9 @@ class MemDiagPlugin(MaiBotPlugin):
         self._pack_task: Optional[asyncio.Task[None]] = None
         self._pack_cancel: Optional[threading.Event] = None
         self._targets: Optional[Targets] = None
+        # 采集实际在用的配置。配置变更失败时 self.cfg 已是新值，采集还在按旧值跑。
+        self._running_cfg: Optional[MemDiagConfig] = None
+        self._config_error: Optional[str] = None
         self._fast_sink: Optional[storage.RotatingJsonl] = None
         self._trend_sink: Optional[storage.RotatingJsonl] = None
         self._latest: Optional[Dict[str, Any]] = None
@@ -268,6 +273,8 @@ class MemDiagPlugin(MaiBotPlugin):
                     "配置变更后解析采集目标失败，没有按新配置重启采集（原有采集不受影响）: %r\n%s", exc,
                     "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
                 )
+                # 只记类型：这段文字会进 /memdiag 回复，而找不到主库的异常文本带绝对路径；完整原因在上面的日志里。
+                self._config_error = type(exc).__name__
                 raise
             if self._closed:
                 self.ctx.logger.info("内存诊断在配置变更途中被卸载，不再重启采集")
@@ -290,6 +297,7 @@ class MemDiagPlugin(MaiBotPlugin):
         data_dir = Path(self.ctx.paths.data_dir)
         max_bytes = cfg.storage.max_file_mb * 1024 * 1024
         self._targets = targets
+        self._running_cfg, self._config_error = cfg, None
         self._fast_sink = storage.RotatingJsonl(data_dir, FAST_STEM, max_bytes, cfg.storage.fast_backups)
         self._trend_sink = storage.RotatingJsonl(data_dir, TREND_STEM, max_bytes, cfg.storage.trend_backups)
         self._latest = self._last_trend = self._db_light = self._db_heavy = None
@@ -362,9 +370,10 @@ class MemDiagPlugin(MaiBotPlugin):
                 "诊断包生成失败: %r\n%s", exc, "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             )
 
-    async def _config_value(self, key: str, expected: type) -> Any:
+    async def _config_value(self, key: str, expected: type, timeout_ms: Optional[int] = None) -> Any:
         # 不传 default：键缺失时宿主返回 None，按类型校验直接报错，不用默认值掩盖。
-        value = await self.ctx.config.get(key)
+        # 走 call_capability：ctx.config.get 是它的包装，但不接受超时。
+        value = await self.ctx.call_capability("config.get", timeout_ms=timeout_ms, key=key)
         if not isinstance(value, expected) or (expected is int and isinstance(value, bool)):
             raise RuntimeError(f"宿主配置 {key} 不可用: {value!r}")
         return value
@@ -388,7 +397,7 @@ class MemDiagPlugin(MaiBotPlugin):
             instance_root=root,
             webui_port=webui_port,
             watched_files={
-                # 1.2.3 是整份 JSON；dev 改为 JSONL 并在迁移后删除旧文件，迁移瞬间可能两个都在。
+                # 已发布的版本都是整份 JSON；JSONL 留给改成追加写的版本，迁移瞬间可能两个都在。
                 "review_log_json": logs / "expression_review" / "review_logs.json",
                 "review_log_jsonl": logs / "expression_review" / "review_logs.jsonl",
                 # v1.3.13 起宿主自带的进程内内存诊断日志，1.2.3 没有。
@@ -442,8 +451,9 @@ class MemDiagPlugin(MaiBotPlugin):
             self.ctx.logger.warning("趋势文件有 %d 行无法解析（多半是磁盘写满或断电留下的半行），已跳过", broken)
         for timestamp, primary in restored:
             self._remember(timestamp, primary)
-        meta = await asyncio.to_thread(collector.meta, {"plugin_version": PLUGIN_VERSION, "config": config_snapshot(cfg)})
-        await asyncio.to_thread(trend_sink.append, meta)
+        meta: Optional[Dict[str, Any]] = await asyncio.to_thread(
+            collector.meta, {"plugin_version": PLUGIN_VERSION, "config": config_snapshot(cfg)}
+        )
         tables = await asyncio.to_thread(
             dbstats.existing_tables, targets.db_files["main_db"], cfg.collector.sql_limit_ms, cancel=cancel
         )
@@ -478,6 +488,10 @@ class MemDiagPlugin(MaiBotPlugin):
                 if now >= next_trend:
                     kind = "trend"
                     next_trend = now + cfg.collector.trend_interval_sec
+                    if meta is not None:
+                        # 写在循环里：轮转被占用或磁盘写满时与样本一样计入连续失败、下一轮重试，不让采集一启动就结束。
+                        await asyncio.to_thread(trend_sink.append, meta)
+                        meta = None
                     record = await asyncio.to_thread(
                         self._trend_round, collector, trend_sink, tables, msg_max, cfg.collector.sql_limit_ms, cancel
                     )
@@ -527,7 +541,7 @@ class MemDiagPlugin(MaiBotPlugin):
 
     async def _probe_rpc_ms(self) -> float:
         started = time.perf_counter()
-        await self._config_value("webui.enabled", bool)
+        await self._config_value("webui.enabled", bool, timeout_ms=PROBE_TIMEOUT_MS)
         return (time.perf_counter() - started) * 1000.0
 
     @staticmethod
@@ -591,7 +605,7 @@ class MemDiagPlugin(MaiBotPlugin):
         allowed = self.cfg.command.allowed_users
         if not allowed or is_local_operator:
             return True
-        # 与宿主 build_scoped_user_id 一致：平台转小写，用户号只去空白（1.2.3 把整条转小写，大写用户号会匹配失败）。
+        # 与宿主 build_scoped_user_id 一致：平台转小写，用户号只去空白（1.2.5 之前的宿主把整条转小写，大写用户号会匹配失败）。
         normalized = set()
         for entry in allowed:
             entry_platform, sep, entry_user = entry.strip().partition(":")
@@ -615,6 +629,7 @@ class MemDiagPlugin(MaiBotPlugin):
         if targets is None:
             return f"内存诊断：采集{self._state}，没有可用的目标进程。"
         ended = time.monotonic() if self._ended_mono is None else self._ended_mono
+        state = self._state if self._config_error is None else f"{self._state}（未按新配置重启：{self._config_error}，详见日志）"
         return report.format_summary(
             latest=self._latest,
             history=list(self._history),
@@ -623,9 +638,9 @@ class MemDiagPlugin(MaiBotPlugin):
             db_heavy=self._db_heavy,
             primary_label="匿名内存" if IS_LINUX else "提交内存",
             worker_pid=targets.worker_pid,
-            collector_state=self._state,
+            collector_state=state,
             sampled_seconds=ended - self._started_mono,
-            fast_interval_sec=self.cfg.collector.fast_interval_sec,
+            fast_interval_sec=cast(MemDiagConfig, self._running_cfg).collector.fast_interval_sec,
             output_dir=self._display_path(Path(self.ctx.paths.data_dir)) if include_dir else None,
             webui_enabled=targets.webui_port is not None,
         )
@@ -643,7 +658,7 @@ class MemDiagPlugin(MaiBotPlugin):
 
     async def _pack(self, stream_id: str, cancel: threading.Event) -> None:
         targets = cast(Targets, self._targets)
-        cfg = self.cfg
+        cfg = cast(MemDiagConfig, self._running_cfg)
         summary = self._summary_text(include_dir=False)
         sinks = [sink for sink in (self._fast_sink, self._trend_sink) if sink is not None]
         try:

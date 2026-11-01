@@ -54,20 +54,22 @@ class FakeSend:
 
 
 class FakeConfig:
-    """宿主 config.get：键缺失时返回 default。delay 模拟 Worker 主循环卡顿，fail 模拟 RPC 失败。"""
+    """宿主的 config.get 能力：键缺失时返回 None。delay 模拟 Worker 主循环卡顿，fail 模拟 RPC 失败。"""
 
     def __init__(self, values):
         self.values = values
         self.delay = 0.0
         self.fail = False
+        self.timeouts = {}
 
-    async def get(self, key, default=None):
+    async def call_capability(self, capability, timeout_ms=None, **kwargs):
+        assert capability == "config.get"
+        self.timeouts.setdefault(kwargs["key"], []).append(timeout_ms)
         if self.delay:
             await asyncio.sleep(self.delay)
         if self.fail:
             raise ConnectionResetError("Connection lost")
-        value = self.values.get(key)
-        return default if value is None else value
+        return self.values.get(kwargs["key"])
 
 
 class RecordingLogger:
@@ -112,9 +114,11 @@ def make_instance(tmp_path):
 def make_plugin(data_dir, config_values=None, **config_overrides):
     plugin = plugin_module.create_plugin()
     send = FakeSend()
+    config_capability = FakeConfig(dict(config_values or DEFAULT_HOST_CONFIG))
     ctx = SimpleNamespace(
         send=send,
-        config=FakeConfig(dict(config_values or DEFAULT_HOST_CONFIG)),
+        config=config_capability,
+        call_capability=config_capability.call_capability,
         paths=SimpleNamespace(data_dir=data_dir, runtime_dir=data_dir),
         logger=RecordingLogger(),
     )
@@ -289,6 +293,13 @@ def test_whitelist_normalizes_platform_and_rejects_malformed_entries(tmp_path):
         bad._whitelisted("qq", "10001", False)
 
 
+def test_whitelist_user_ids_are_case_sensitive(tmp_path):
+    # 部分平台的用户 ID 含大写（openid）：两侧都不能转小写，否则大写用户被拒，或只差大小写的另一个用户被放行。
+    plugin, _ = make_plugin(tmp_path, command={"allowed_users": ["QQ:AbC"]})
+    assert plugin._whitelisted("qq", "AbC", False)
+    assert not plugin._whitelisted("qq", "abc", False)
+
+
 def test_denied_user_gets_reply_and_command_is_intercepted(tmp_path):
     plugin, send = make_plugin(tmp_path, command={"allowed_users": ["qq:1"]})
     result = asyncio.run(plugin.handle_memdiag(stream_id="s", matched_groups={"sub": None}, platform="qq",
@@ -369,12 +380,121 @@ def test_config_update_starts_from_a_clean_summary_state(instance):
     async def scenario():
         await plugin.on_load()
         await wait_until(lambda: plugin._latest is not None and plugin._last_trend is not None)
+        plugin._db_heavy = {"mai_messages_total": 999}
         await plugin.on_config_update("self", {}, "")
-        state = (plugin._latest, plugin._last_trend, plugin._db_light, plugin._state)
+        # _ended_mono 留着旧值时摘要的采样时长会冻结甚至变成负数。
+        state = (plugin._latest, plugin._last_trend, plugin._db_light, plugin._db_heavy, plugin._ended_mono, plugin._state)
         await plugin.on_unload()
         return state
 
-    assert asyncio.run(scenario()) == (None, None, None, "运行中")
+    assert asyncio.run(scenario()) == (None, None, None, None, None, "运行中")
+
+
+@needs_platform
+def test_failed_config_update_leaves_the_summary_on_the_running_config(instance, monkeypatch):
+    # 宿主先换配置再通知插件：通知失败后 self.cfg 已是新值，采集还在按旧值跑，摘要判断样本是否过旧要用旧值。
+    _, data_dir = instance
+    plugin, _ = make_plugin(data_dir, collector={"fast_interval_sec": 300})
+    summaries = []
+    original = plugin_module.report.format_summary
+
+    def format_summary(**kwargs):
+        summaries.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(plugin_module.report, "format_summary", format_summary)
+
+    async def scenario():
+        await plugin.on_load()
+        running = plugin._task
+        await wait_until(lambda: plugin._latest is not None)
+        plugin.set_plugin_config({**plugin.cfg.model_dump(), "collector": {"fast_interval_sec": 5}})
+        plugin.ctx.config.fail = True
+        with pytest.raises(ConnectionResetError):
+            await plugin.on_config_update("self", {}, "")
+        same_collector = plugin._task is running
+        failed_summary = plugin._summary_text(include_dir=False)
+        plugin.ctx.config.fail = False
+        await plugin.on_config_update("self", {}, "")
+        recovered_summary = plugin._summary_text(include_dir=False)
+        await plugin.on_unload()
+        return same_collector, failed_summary, recovered_summary
+
+    same_collector, failed_summary, recovered_summary = asyncio.run(scenario())
+    assert same_collector is True
+    assert summaries[0]["fast_interval_sec"] == 300
+    assert "未按新配置重启：ConnectionResetError，详见日志" in failed_summary
+    # 下一次配置变更成功后按新配置运行，提示随之消失。
+    assert summaries[1]["fast_interval_sec"] == 5
+    assert "未按新配置重启" not in recovered_summary
+
+
+@needs_platform
+def test_failed_config_update_keeps_the_error_text_out_of_the_reply(instance):
+    # 回复可能发在群里，找不到主库的异常文本带绝对路径（常含系统用户名），只进日志。
+    root, data_dir = instance
+    plugin, send = make_plugin(data_dir)
+
+    async def scenario():
+        await plugin.on_load()
+        # 第一轮趋势结束后，下一次读库在 300 秒之后，改名时没有连接占着主库。
+        await wait_until(lambda: plugin._last_trend is not None)
+        (root / "data" / "MaiBot.db").rename(root / "data" / "moved.db")
+        with pytest.raises(FileNotFoundError):
+            await plugin.on_config_update("self", {}, "")
+        await plugin.handle_memdiag(stream_id="s", matched_groups={"sub": None}, platform="qq", user_id="1",
+                                    is_local_operator=False)
+        await plugin.on_unload()
+
+    asyncio.run(scenario())
+    assert "未按新配置重启：FileNotFoundError，详见日志" in send.sent[-1]["text"]
+    assert "找不到主库" not in send.sent[-1]["text"]
+    assert any("找不到主库" in text for text in plugin.ctx.logger.levels("error"))
+
+
+@needs_platform
+def test_failed_config_update_still_applies_the_whitelist(instance):
+    # 白名单每次命令都读当前配置，不依赖采集重启：重启失败时，刚移除的用户也要立刻被拒。
+    _, data_dir = instance
+    plugin, _ = make_plugin(data_dir, command={"allowed_users": ["qq:1"]})
+
+    async def scenario():
+        await plugin.on_load()
+        plugin.set_plugin_config({**plugin.cfg.model_dump(), "command": {"allowed_users": ["qq:2"]}})
+        plugin.ctx.config.fail = True
+        with pytest.raises(ConnectionResetError):
+            await plugin.on_config_update("self", {}, "")
+        allowed = plugin._whitelisted("qq", "2", False), plugin._whitelisted("qq", "1", False)
+        await plugin.on_unload()
+        return allowed
+
+    assert asyncio.run(scenario()) == (True, False)
+
+
+@needs_platform
+def test_failed_config_update_packs_the_running_config(instance):
+    _, data_dir = instance
+    plugin, send = make_plugin(data_dir, collector={"sql_limit_ms": 300})
+
+    async def scenario():
+        await plugin.on_load()
+        await wait_until(lambda: plugin._latest is not None)
+        plugin.set_plugin_config({**plugin.cfg.model_dump(), "collector": {"sql_limit_ms": 4000}})
+        plugin.ctx.config.fail = True
+        with pytest.raises(ConnectionResetError):
+            await plugin.on_config_update("self", {}, "")
+        plugin.ctx.config.fail = False
+        await plugin.handle_memdiag(stream_id="s", matched_groups={"sub": "pack"}, platform="qq", user_id="1",
+                                    is_local_operator=False)
+        await wait_until(lambda: len(send.sent) >= 2)
+        await plugin.on_unload()
+
+    asyncio.run(scenario())
+    pack = next((data_dir / "packs").glob("memdiag-*.zip"))
+    with zipfile.ZipFile(pack) as archive:
+        meta = json.loads(archive.read("meta.json"))
+    # 样本是按旧配置采的，包里的配置要与样本一致。
+    assert meta["config"]["collector"]["sql_limit_ms"] == 300
 
 
 @needs_platform
@@ -770,6 +890,45 @@ def test_rpc_probe_keeps_one_request_in_flight_and_reports_its_real_duration():
     assert third == {"rpc_ms": 1234.5}
 
 
+def test_rpc_probe_measures_milliseconds(tmp_path):
+    plugin, _ = make_plugin(tmp_path)
+    plugin.ctx.config.delay = 0.2
+    elapsed = asyncio.run(plugin._probe_rpc_ms())
+    # 下界留出一个时钟分辨率：asyncio.sleep 按 monotonic 计时，在 Windows 上粒度约 15 毫秒。
+    assert 150 <= elapsed < 5000
+
+
+def test_rpc_probe_asks_for_more_than_the_default_rpc_timeout(tmp_path):
+    # 宿主默认 30 秒超时：超过它的卡顿会被切成几段，rpc_ms 记不下真实时长。
+    plugin, _ = make_plugin(tmp_path)
+    asyncio.run(plugin._probe_rpc_ms())
+    assert plugin.ctx.config.timeouts["webui.enabled"] == [plugin_module.PROBE_TIMEOUT_MS]
+    assert plugin_module.PROBE_TIMEOUT_MS > 30_000
+
+
+@needs_platform
+@pytest.mark.parametrize(("interval", "expected"), [(6, 3.0), (15, 5.0), (300, 5.0)])
+def test_each_round_waits_for_the_probe_at_most_five_seconds(instance, monkeypatch, interval, expected):
+    # 等得更久的话，Worker 主循环卡住时这一轮的样本迟迟不落盘，OOM 前最后的样本就丢了。
+    _, data_dir = instance
+    plugin, _ = make_plugin(data_dir, collector={"fast_interval_sec": interval})
+    waits = []
+
+    async def measure(self, wait_sec):
+        waits.append(wait_sec)
+        return {"rpc_ms": 1.0}
+
+    monkeypatch.setattr(plugin_module.RpcProbe, "measure", measure)
+
+    async def scenario():
+        await plugin.on_load()
+        await wait_until(lambda: waits != [])
+        await plugin.on_unload()
+
+    asyncio.run(scenario())
+    assert waits[0] == expected
+
+
 def test_rpc_probe_close_cancels_the_request():
     async def scenario():
         async def call():
@@ -1104,6 +1263,66 @@ def test_start_removes_backups_beyond_the_configured_count(instance, monkeypatch
     assert not (data_dir / "fast.3.jsonl").exists() and (data_dir / "fast.4.jsonl").exists()
     assert any("fast.3.jsonl" in text for text in plugin.ctx.logger.levels("info"))
     assert any("fast.4.jsonl" in text and "删不掉" in text for text in plugin.ctx.logger.levels("warning"))
+
+
+@needs_platform
+def test_failed_start_meta_is_retried_instead_of_ending_collection(instance, monkeypatch):
+    _, data_dir = instance
+    plugin, _ = make_plugin(data_dir, collector={"max_consecutive_failures": 100})
+    speed_up(plugin, trend_interval_sec=0.05)
+    blocked = threading.Event()
+    blocked.set()
+    written = []
+    original = plugin_module.storage.RotatingJsonl.append
+
+    def append(self, record):
+        if record["k"] == "meta" and blocked.is_set():
+            raise PermissionError(13, "being used by another process")
+        original(self, record)
+        written.append(record["k"])
+
+    monkeypatch.setattr(plugin_module.storage.RotatingJsonl, "append", append)
+
+    async def scenario():
+        await plugin.on_load()
+        task = plugin._task
+        await wait_until(lambda: "error" in written)
+        still_running = not task.done()
+        blocked.clear()
+        await wait_until(lambda: written.count("trend") >= 2)
+        await plugin.on_unload()
+        return still_running
+
+    assert asyncio.run(scenario()) is True
+    errors = [record for record in read_records(data_dir / "trend.jsonl") if record["k"] == "error"]
+    assert (errors[0]["kind"], errors[0]["n"]) == ("trend", 1)
+    # 只写成一次，且排在第一条趋势记录之前；重试期间到点的 db 记录可能排在它前面。
+    assert written.count("meta") == 1
+    assert written.index("meta") < written.index("trend")
+
+
+@needs_platform
+def test_start_meta_that_keeps_failing_stops_at_the_failure_limit(instance, monkeypatch):
+    _, data_dir = instance
+    plugin, _ = make_plugin(data_dir, collector={"max_consecutive_failures": 2})
+    speed_up(plugin, trend_interval_sec=0.02)
+    original = plugin_module.storage.RotatingJsonl.append
+
+    def append(self, record):
+        if record["k"] == "meta":
+            raise PermissionError(13, "being used by another process")
+        original(self, record)
+
+    monkeypatch.setattr(plugin_module.storage.RotatingJsonl, "append", append)
+
+    async def scenario():
+        await plugin.on_load()
+        await wait_until(lambda: "异常" in plugin._state)
+        await plugin.on_unload()
+
+    asyncio.run(scenario())
+    errors = [record for record in read_records(data_dir / "trend.jsonl") if record["k"] == "error"]
+    assert [(record["kind"], record["n"]) for record in errors] == [("trend", 1), ("trend", 2)]
 
 
 @needs_platform

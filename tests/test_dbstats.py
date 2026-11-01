@@ -164,23 +164,26 @@ def test_cancel_between_short_statements_raises(db, monkeypatch):
         dbstats.run_readonly(db, [("a", "SELECT 1", ()), ("b", "PRAGMA page_count", ())], 300, cancel=stop)
 
 
-def test_cancel_reaches_the_unaggregated_tail_queries(db, monkeypatch):
+@pytest.mark.parametrize(("stop_after", "stopped_at"), [(None, ["max"]), (["max"], ["tail"])])
+def test_cancel_reaches_the_unaggregated_tail_queries(db, monkeypatch, stop_after, stopped_at):
     stop = threading.Event()
     tables = dbstats.existing_tables(db, 300, cancel=stop)
     original = dbstats.run_readonly
     batches = []
 
-    def stop_after_first_batch(path, queries, limit_ms, *, cancel):
-        batches.append([name for name, _, _ in queries])
+    def stop_after_batch(path, queries, limit_ms, *, cancel):
+        names = [name for name, _, _ in queries]
+        batches.append(names)
         result = original(path, queries, limit_ms, cancel=cancel)
-        stop.set()
+        if stop_after in (None, names):
+            stop.set()
         return result
 
-    monkeypatch.setattr(dbstats, "run_readonly", stop_after_first_batch)
+    monkeypatch.setattr(dbstats, "run_readonly", stop_after_batch)
     with pytest.raises(dbstats.Cancelled):
         dbstats.heavy_stats(db, tables, 300, cancel=stop, now=datetime(2026, 10, 29, 12, 0, 0))
-    # 主批查询之后的尾部计数用的是同一个停止信号，入口处就被拦下。
-    assert batches[1] == ["max"]
+    # 主批之后的 MAX 与尾部 COUNT 用的是同一个停止信号，各自在入口处被拦下。
+    assert batches[-1] == stopped_at
 
 
 def test_cancel_interrupts_a_running_query(db):
