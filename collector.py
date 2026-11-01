@@ -133,8 +133,9 @@ class Collector:
 
     def check_worker(self) -> None:
         pid = self.targets.worker_pid
-        # Worker 被杀后 Runner 不会自行退出（宿主断连不结束 Runner），Linux 与 macOS 上会被收养，父进程号随之改变。
-        if not IS_WINDOWS and os.getppid() != pid:
+        # Worker 被杀后 Runner 不会自行退出（宿主断连不结束 Runner），Linux 上会被收养，父进程号随之改变。
+        # macOS 不比对：调试器附加 Runner 时父进程号会变成调试器；Worker 退出时下面读启动时间已经报 ESRCH。
+        if IS_LINUX and os.getppid() != pid:
             raise WorkerGone(f"父进程已从 Worker pid={pid} 变为 {os.getppid()}，Worker 已退出")
         try:
             current = identity_of(pid)

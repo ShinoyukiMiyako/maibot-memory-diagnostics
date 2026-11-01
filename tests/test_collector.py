@@ -100,7 +100,7 @@ def make_targets(tmp_path, **overrides):
 
 
 def as_runner_child(monkeypatch):
-    # Linux 与 macOS 上 check_worker 还会比对 getppid；让测试进程扮演“自己的 Runner”，被测的 Worker 就是测试进程本身。
+    # Linux 上 check_worker 还会比对 getppid；让测试进程扮演“自己的 Runner”，被测的 Worker 就是测试进程本身。
     monkeypatch.setattr(collector.os, "getppid", lambda: os.getpid())
 
 
@@ -255,13 +255,11 @@ def test_check_worker_converts_unreadable_worker_into_worker_gone(tmp_path, monk
         Collector(make_targets(tmp_path)).check_worker()
 
 
-@SUPPORTED
-def test_check_worker_detects_reparenting(tmp_path, monkeypatch):
-    if collector.IS_WINDOWS:
-        pytest.skip("Windows 不给孤儿进程改父进程号")
-    monkeypatch.setattr(collector.os, "getppid", lambda: 1)
-    with pytest.raises(WorkerGone):
-        Collector(make_targets(tmp_path, worker_identity=identity_of(os.getpid()))).check_worker()
+def test_check_worker_detects_reparenting_on_linux(tmp_path, monkeypatch):
+    monkeypatch.setattr(collector, "IS_LINUX", True)
+    monkeypatch.setattr(collector.os, "getppid", lambda: 1, raising=False)
+    with pytest.raises(WorkerGone, match="父进程"):
+        Collector(make_targets(tmp_path)).check_worker()
 
 
 @SUPPORTED
@@ -355,6 +353,7 @@ class FakeDarwinproc:
         self.children = {11: "Node", 12: "node", 13: "gone", 14: "root-owned"}
         self.failures = {13: ProcessLookupError(3, "No such process"), 14: PermissionError(1, "Operation not permitted")}
         self.threads_failure = None
+        self.created_failure = None
 
     def process_memory(self, pid):
         if pid in self.failures:
@@ -370,6 +369,8 @@ class FakeDarwinproc:
         return self.children
 
     def process_created(self, pid):
+        if self.created_failure is not None:
+            raise self.created_failure
         return 123456
 
     def find_worker_pid(self):
@@ -409,6 +410,22 @@ def test_fast_darwin_treats_a_vanished_worker_as_gone(darwin):
         sampler.fast()
 
 
+def test_fast_darwin_reads_the_threads_after_the_memory(darwin):
+    # 僵尸进程的内存读数不报错：读完内存才退出的 Worker 要靠随后的线程数发现，这条样本不能写进去。
+    sampler, fake = darwin
+    read_memory = fake.process_memory
+
+    def worker_exits_after_the_read(pid):
+        memory = read_memory(pid)
+        if pid == 100:
+            fake.threads_failure = ProcessLookupError(3, "No such process")
+        return memory
+
+    fake.process_memory = worker_exits_after_the_read
+    with pytest.raises(WorkerGone):
+        sampler.fast()
+
+
 def test_fast_darwin_does_not_hide_other_worker_failures(darwin):
     # 读不了 Worker 不等于 Worker 退出了：要算采样失败，不能悄悄结束采集。
     sampler, fake = darwin
@@ -422,12 +439,18 @@ def test_identity_and_worker_lookup_use_darwinproc(darwin):
     assert collector.find_worker() == (100, (100, 123456))
 
 
-def test_check_worker_compares_the_parent_on_darwin(tmp_path, monkeypatch, darwin):
-    monkeypatch.setattr(collector.os, "getppid", lambda: 1)
+def test_check_worker_ignores_the_parent_on_darwin(tmp_path, monkeypatch, darwin):
+    # 调试器附加 Runner 时父进程号变成调试器，Worker 还活着，采集不能因此停下。
+    monkeypatch.setattr(collector.os, "getppid", lambda: 4242)
+    Collector(make_targets(tmp_path, worker_pid=100, worker_identity=(100, 123456))).check_worker()
+
+
+def test_check_worker_finds_a_dead_worker_by_its_identity_on_darwin(tmp_path, monkeypatch, darwin):
+    _, fake = darwin
+    monkeypatch.setattr(collector.os, "getppid", lambda: 100)
+    fake.created_failure = ProcessLookupError(3, "No such process")
     with pytest.raises(WorkerGone):
         Collector(make_targets(tmp_path, worker_pid=100, worker_identity=(100, 123456))).check_worker()
-    monkeypatch.setattr(collector.os, "getppid", lambda: 100)
-    Collector(make_targets(tmp_path, worker_pid=100, worker_identity=(100, 123456))).check_worker()
 
 
 @SUPPORTED

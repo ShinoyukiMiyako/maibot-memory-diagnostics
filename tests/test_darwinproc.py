@@ -11,8 +11,15 @@ import pytest
 
 from memdiag import darwinproc
 
+
+
+def has_command_line_tools():
+    # 没装 Command Line Tools 的 Mac 上 /usr/bin/cc 是占位程序，能在 PATH 里找到，执行它会弹安装框；xcode-select -p 不会。
+    return sys.platform == "darwin" and subprocess.run(["xcode-select", "-p"], capture_output=True).returncode == 0
+
+
 darwin_only = pytest.mark.skipif(sys.platform != "darwin", reason="只在 macOS 上有意义")
-needs_cc = pytest.mark.skipif(shutil.which("cc") is None, reason="对照系统头文件需要 C 编译器")
+needs_cc = pytest.mark.skipif(not has_command_line_tools(), reason="对照系统头文件需要 Command Line Tools")
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MIB = 1024 * 1024
@@ -24,7 +31,8 @@ def run_c_program(tmp_path, body):
     source = tmp_path / "probe.c"
     source.write_text(f"{LAYOUT_HEADERS}int main(void) {{\n{body}\nreturn 0;\n}}\n", encoding="utf-8")
     binary = tmp_path / "probe"
-    subprocess.run(["cc", str(source), "-o", str(binary)], check=True, capture_output=True, text=True)
+    compiled = subprocess.run(["cc", str(source), "-o", str(binary)], capture_output=True, text=True)
+    assert compiled.returncode == 0, compiled.stderr
     return subprocess.run([str(binary)], check=True, capture_output=True, text=True).stdout
 
 
@@ -42,7 +50,12 @@ GONE = ProcessLookupError(3, "No such process")
 
 
 def fake_tree(monkeypatch, tree, names, failure=GONE):
+    calls = []
+
     def child_pids(pid):
+        calls.append(pid)
+        # 项目没有测试超时：走不完时要失败，不能让测试空转。
+        assert len(calls) < 100, "遍历进程树没有结束"
         return tree.get(pid, [])
 
     def process_name(pid):
@@ -67,11 +80,28 @@ def test_descendants_skips_processes_it_cannot_read(monkeypatch, failure):
     assert darwinproc.descendants(10) == {11: "node"}
 
 
+def test_descendants_ends_on_a_cycle_and_leaves_out_the_root(monkeypatch):
+    # 10 是 Worker，12 是它后代里的调试器：附加 10 后 10 同时列在 12 名下。
+    fake_tree(monkeypatch, {10: [11], 11: [12], 12: [10, 13]}, {10: "Python", 11: "zsh", 12: "lldb", 13: "debugserver"})
+    assert darwinproc.descendants(10) == {11: "zsh", 12: "lldb", 13: "debugserver"}
+
+
+def test_descendants_reads_a_process_listed_under_two_parents_once(monkeypatch):
+    fake_tree(monkeypatch, {10: [11, 12], 11: [13], 12: [13]}, {11: "Python", 12: "lldb", 13: "node"})
+    read = []
+    process_name = darwinproc.process_name
+    monkeypatch.setattr(darwinproc, "process_name", lambda pid: (read.append(pid), process_name(pid))[1])
+    assert darwinproc.descendants(10) == {11: "Python", 12: "lldb", 13: "node"}
+    assert sorted(read) == [11, 12, 13]
+
+
 class FakeLibproc:
     """按真实 libproc 的约定：proc_listpids 返回字节数，出错时返回 0 并设 errno；proc_pid_rusage 出错返回 -1。"""
 
-    def __init__(self, pids=(), failing_errno=0, fail_at_call=0, pidinfo=0, comm=b"", name=b""):
+    def __init__(self, pids=(), failing_errno=0, fail_at_call=0, pidinfo=0, comm=b"", name=b"", flags=0, ppid=0):
         self.pids = pids
+        self.flags = flags
+        self.ppid = ppid
         self.failing_errno = failing_errno
         self.fail_at_call = fail_at_call
         self.calls = 0
@@ -98,6 +128,8 @@ class FakeLibproc:
         if isinstance(buffer._obj, darwinproc.proc_bsdinfo):
             buffer._obj.pbi_comm = self.comm
             buffer._obj.pbi_name = self.name
+            buffer._obj.pbi_flags = self.flags
+            buffer._obj.pbi_ppid = self.ppid
         return self.pidinfo
 
     def proc_pid_rusage(self, pid, flavor, buffer):
@@ -158,15 +190,27 @@ def test_process_name_prefers_the_full_name_and_falls_back_to_comm(monkeypatch):
     assert darwinproc.process_name(10) == "sleep"
 
 
+def test_find_worker_pid_is_the_parent(monkeypatch):
+    # 0x404010 是实测的普通进程标志，不含被跟踪位。
+    use_libproc(monkeypatch, pidinfo=ctypes.sizeof(darwinproc.proc_bsdinfo), flags=0x404010, ppid=100)
+    assert darwinproc.find_worker_pid() == 100
+
+
+def test_find_worker_pid_refuses_while_a_debugger_is_attached(monkeypatch):
+    use_libproc(monkeypatch, pidinfo=ctypes.sizeof(darwinproc.proc_bsdinfo), flags=0x404012, ppid=4242)
+    with pytest.raises(RuntimeError, match="4242"):
+        darwinproc.find_worker_pid()
+
+
 # ---- 真实 libproc ----------------------------------------------------------------
 
 
 @darwin_only
 @needs_cc
 def test_constants_match_the_system_headers(tmp_path):
-    output = run_c_program(tmp_path, r'printf("%d %d %d %d %d\n", PROC_PIDTBSDINFO, PROC_PIDTASKINFO, PROC_PPID_ONLY, RUSAGE_INFO_V4, MAXCOMLEN);')
+    output = run_c_program(tmp_path, r'printf("%d %d %d %d %d %d\n", PROC_PIDTBSDINFO, PROC_PIDTASKINFO, PROC_PPID_ONLY, PROC_FLAG_TRACED, RUSAGE_INFO_V4, MAXCOMLEN);')
     assert output.split() == [str(value) for value in (
-        darwinproc.PROC_PIDTBSDINFO, darwinproc.PROC_PIDTASKINFO, darwinproc.PROC_PPID_ONLY,
+        darwinproc.PROC_PIDTBSDINFO, darwinproc.PROC_PIDTASKINFO, darwinproc.PROC_PPID_ONLY, darwinproc.PROC_FLAG_TRACED,
         darwinproc.RUSAGE_INFO_V4, darwinproc.MAXCOMLEN,
     )]
 

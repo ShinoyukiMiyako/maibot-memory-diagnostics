@@ -18,6 +18,7 @@ LIBPROC_PATH = "/usr/lib/libproc.dylib"
 PROC_PIDTBSDINFO = 3
 PROC_PIDTASKINFO = 4
 PROC_PPID_ONLY = 6
+PROC_FLAG_TRACED = 2
 RUSAGE_INFO_V4 = 4
 MAXCOMLEN = 16
 # proc_listpids 先问大小再取，两次调用之间可能又有新进程。
@@ -197,7 +198,12 @@ def child_pids(pid: int) -> List[int]:
 
 
 def find_worker_pid() -> int:
-    return os.getppid()
+    info = proc_bsdinfo()
+    _pidinfo(os.getpid(), PROC_PIDTBSDINFO, info)
+    # lldb 附加期间父进程号是它的 debugserver，脱离后才还原；认成 Worker 的话，采到的全是调试器的内存。
+    if info.pbi_flags & PROC_FLAG_TRACED:
+        raise RuntimeError(f"Runner 正被调试器附加，父进程 {info.pbi_ppid} 不是 Worker，无法确定 Worker")
+    return info.pbi_ppid
 
 
 def descendants(root_pid: int) -> Dict[int, str]:
@@ -206,9 +212,14 @@ def descendants(root_pid: int) -> Dict[int, str]:
     列举之后已退出、无权访问的进程，以及 proc_listpids 会列出的僵尸进程，都读不到名字，直接略过。
     """
     result: Dict[int, str] = {}
+    # 被调试的进程同时列在原父进程与调试器名下；进程树里的调试器附加自己的祖先时，父子关系可能成环。
+    seen = {root_pid}
     frontier = [root_pid]
     while frontier:
         for pid in child_pids(frontier.pop()):
+            if pid in seen:
+                continue
+            seen.add(pid)
             try:
                 result[pid] = process_name(pid)
             except OSError:

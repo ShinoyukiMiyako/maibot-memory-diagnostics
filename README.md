@@ -25,6 +25,9 @@
 真实宿主上的端到端验证只在 Linux 上做过。Windows 与 macOS 上跑过采集代码的全部测试（macOS 为 GitHub Actions 的
 arm64 与 Intel 机器，读的是真实进程），没有在真实宿主里运行过。
 
+macOS 上用 lldb 附加插件 Runner 时，已在运行的采集不受影响；但附加期间 Runner 的父进程号是调试器，
+这时加载插件或按新配置重启采集会报错，脱离后重载插件即可。
+
 ## 安装
 
 1. 把本仓库放到 MaiBot 实例根目录的 `plugins/` 下，例如 `plugins/maibot-memory-diagnostics/`
@@ -71,7 +74,7 @@ arm64 与 Intel 机器，读的是真实进程），没有在真实宿主里运�
 
 | 档位 | 默认间隔 | 内容 |
 | --- | --- | --- |
-| 快速样本 `fast` | 15 秒 | Worker 的 RSS、匿名内存（Windows 为提交内存，macOS 为物理占用）、峰值、线程数（Windows 为句柄数）；按可执行文件名汇总的子进程内存（插件 Runner、Chromium、Node 等，另计正在退出的进程数）；Runner 自身内存；WebUI 端口上 Worker 的连接数、发送队列、疑似停止读取的连接数；一次到 Worker 的 RPC 往返耗时 |
+| 快速样本 `fast` | 15 秒 | Worker 的 RSS、匿名内存（Windows 为提交内存，macOS 为物理占用）、峰值、线程数（Windows 为句柄数）；按可执行文件名汇总的子进程内存（Linux 上插件 Runner、Chromium 各归一类，另计正在退出的进程数；Windows 与 macOS 按小写的文件名分桶，Runner 算在解释器名下）；Runner 自身内存；WebUI 端口上 Worker 的连接数、发送队列、疑似停止读取的连接数；一次到 Worker 的 RPC 往返耗时 |
 | 趋势记录 `trend` | 5 分钟 | 自上一条趋势记录以来快速样本的最小/最大/末值（上一轮没写成时并进这一条，`window.samples` 相应变多）；`smaps_rollup`；glibc 线程堆估计；fd 分类与主库、元数据库的打开数；cgroup 用量、上限与 OOM 计数；逐条 WebUI 连接；关键文件与目录大小；主库轻量统计（页数、各表最大 id、新增消息数） |
 | 数据库总量 `db` | 1 小时 | 消息总数、图片按类型计数、黑话证据体量、近 30 天消息量（小时聚合表加未聚合尾部的近似值） |
 
@@ -104,9 +107,9 @@ cgroup 按 `mountinfo` 找挂载点，兼容 Docker 的私有与共享 cgroup �
 
 ### 不会做的事
 
-- 不读聊天内容、不读宿主配置文件原文、不记录完整环境变量与命令行。子进程按可执行文件名分类，
-  只在 Worker 的直接子进程上查命令行里有没有插件 Runner 的模块名，不取其中任何文本：
-  npm 等会把含密钥的整条命令行改写进进程标题。
+- 不读聊天内容、不读宿主配置文件原文、不记录完整环境变量与命令行。子进程按可执行文件名分类。
+  Linux 上只查 Worker 及其直接子进程的命令行里有没有插件 Runner 的模块名，不取其中任何文本：
+  npm 等会把含密钥的整条命令行改写进进程标题。Windows 与 macOS 不读命令行。
 - 只以只读方式打开数据库（`mode=ro` 加 `query_only`），每条 SQL 有时限，超时记为测量结果而不是重试。
 - 不写宿主的任何文件，只写自己的数据目录。
 - 不把样本写进日志：宿主日志会推送到 WebUI。
@@ -188,7 +191,7 @@ python -m pytest
 ```
 
 `tests/test_plugin.py` 需要安装 `maibot-plugin-sdk`，没有时自动跳过；其余测试只依赖标准库与 pytest。
-平台专属的测试在别的平台上跳过；macOS 上有 `cc` 时，`tests/test_darwinproc.py` 会对照系统头文件校验结构体布局。
+平台专属的测试在别的平台上跳过；macOS 上装了 Command Line Tools 时，`tests/test_darwinproc.py` 会对照系统头文件校验结构体布局。
 CI 在 Linux、Windows 与 macOS（arm64、Intel）上跑。
 
 ## 许可证
