@@ -646,7 +646,9 @@ def test_unload_right_after_a_failure_keeps_the_failure_reason(instance, monkeyp
     async def scenario():
         await plugin.on_load()
         task = plugin._task
+        deadline = time.monotonic() + 10
         while not task.done():
+            assert time.monotonic() < deadline
             await asyncio.sleep(0)
         callback_ran = "异常" in plugin._state
         await plugin.on_unload()
@@ -661,7 +663,8 @@ def test_unload_right_after_a_failure_keeps_the_failure_reason(instance, monkeyp
 def test_failure_counter_resets_after_success_and_is_kept_per_kind(instance, monkeypatch):
     _, data_dir = instance
     plugin, _ = make_plugin(data_dir, collector={"max_consecutive_failures": 2})
-    speed_up(plugin, fast_interval_sec=0.02, trend_interval_sec=0.05)
+    # 第 3 次快速采样要排在第 2 次趋势失败之前：两个间隔太近时，写盘慢一点顺序就反了。
+    speed_up(plugin, fast_interval_sec=0.02, trend_interval_sec=0.5)
     original_fast = plugin_module.Collector.fast
     calls = {"fast": 0}
 

@@ -10,6 +10,8 @@ on:
 jobs:
   pytest:
     runs-on: ${{ matrix.os }}
+    # 没有测试超时插件，默认 360 分钟：一次挂起会把 macOS 的额度烧完。正常一个 job 不到一分钟。
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
