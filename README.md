@@ -19,7 +19,8 @@ MaiBot 运行几天到几十天后内存一路上涨、被 OOM 杀掉或被容�
 1. 安装插件，见[安装](#安装)。
 2. 放行 `/memdiag`，见[命令权限](#命令权限)。默认谁都不能用，这是宿主对受保护命令的规定。
 3. 照常使用，不用改配置。Worker 被杀后样本不会丢，重启后自动接着记录。
-4. 内存涨上去或 OOM 之后，向麦麦发 `/memdiag pack`，稍等会收到“诊断包已生成”。
+4. 内存涨上去或 OOM 之后，向麦麦发 `/memdiag pack`，稍等会收到“诊断包已生成”。消息里只能有这串文字：
+   @ 麦麦或引用别的消息时，宿主不把它当命令，只当普通聊天。
 5. 取走诊断包 `memdiag-*.zip`：
 
    | 部署方式 | 诊断包位置 |
@@ -37,8 +38,8 @@ MaiBot 运行几天到几十天后内存一路上涨、被 OOM 杀掉或被容�
    ```
 
 Issue 是公开的。诊断包里是内存读数、文件大小、各表行数与消息量、版本信息和本插件配置，以及 v1.3.13 起宿主自带的
-内存诊断日志；没有聊天内容、宿主配置、API Key 和客户端 IP。`cgroup.path` 可能带容器 ID。
-里面都是 JSON 文本，可以解压看过再发。
+内存诊断日志；没有聊天内容、API Key、客户端 IP 和宿主配置文件的内容，宿主配置只记 WebUI 端口号这类数值。
+`cgroup.path` 可能带容器 ID 或 systemd 单元名。里面都是 JSON 文本，可以解压看过再发。
 
 ## 兼容性
 
@@ -52,8 +53,8 @@ Issue 是公开的。诊断包里是内存读数、文件大小、各表行数�
 | 其他 | 不支持，插件加载时直接报错 |
 
 真实宿主上的端到端验证只在 Linux 上做过：官方 Docker 镜像 1.2.3、1.3.8、1.3.17、1.3.19（含容器 OOM 后恢复采集），
-以及直接运行的 1.2.3。Windows 与 macOS 上跑过采集代码的全部测试（macOS 为 GitHub Actions 的 arm64 与 Intel 机器，
-读的是真实进程），没有在真实宿主里运行过。
+以及直接运行的 1.2.3。其中 ZIP 安装与放行走的是 WebUI 的接口，没有点过页面。Windows 与 macOS 上跑过采集代码的全部测试
+（macOS 为 GitHub Actions 的 arm64 与 Intel 机器，读的是真实进程），没有在真实宿主里运行过。
 
 macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，这段时间没有样本；停住约 35 秒起，
 宿主的健康检查可能重启 Runner。继续运行后采集照常。附加期间 Runner 的父进程号是调试器，认不出 Worker：
@@ -63,7 +64,7 @@ macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，
 
 先下载本仓库：页面上的 Code → Download ZIP。
 
-- WebUI（v1.3.8 起）：在插件配置页选“从 ZIP 安装插件”，上传这个 ZIP，不用解压，然后按提示重启麦麦。
+- WebUI（1.3.3 起）：在侧栏“插件扩展”页点右上角的“更多操作”（…），选“从 ZIP 安装插件”，上传这个 ZIP，不用解压，然后按提示重启麦麦。
 - 手动（所有版本）：解压后把目录放进插件目录，目录里要直接有 `_manifest.json` 与 `plugin.py`，然后重启麦麦。
   插件目录直接运行时是 `<实例根>/plugins/`，Docker（官方 compose）是 `docker-compose.yml` 所在目录下的 `data/MaiMBot/plugins/`。
 
@@ -74,14 +75,21 @@ macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，
 
 `/memdiag` 是宿主意义上的受保护（operator）命令，宿主按下面任一条放行：
 
-- 宿主自带的本地操作员终端（`bot_console` 平台）始终可用。它需要交互式终端，Docker 默认没有。
+- 宿主自带的本地操作员终端（`bot_console` 平台）不受放行规则限制，但要 `[debug].enable_console_input = true`
+  （1.3.0 起默认开，1.2.x 默认关）且有交互式终端，Docker 默认没有。
 - 只放行本命令（推荐）：在 WebUI“麦麦设置”页的“命令管理”标签里选 `/memdiag`（插件 `shinoyuki.memdiag`，可搜 `memdiag`），
-  填写“仅为此命令放行用户”，保存后立即生效，不用重启；或在 MaiBot 的 `bot_config.toml` 里写：
+  填写“仅为此命令放行用户”，保存后立即生效，不用重启。
+
+  也可以手改 MaiBot 的 `bot_config.toml`（Docker 是 `docker-compose.yml` 所在目录下的 `docker-config/mmc/bot_config.toml`）。
+  `[plugin]` 段已经有一行 `command_permissions = {}`，要改写这一行，不能另起 `[plugin.command_permissions...]` 表头：
+  同一个键写两次时配置解析失败，MaiBot 下次重启就起不来。
 
   ```toml
-  [plugin.command_permissions."shinoyuki.memdiag.memdiag"]
-  allow_users = ["qq:123456789"]
+  command_permissions = { "shinoyuki.memdiag.memdiag" = { allow_users = ["qq:123456789"] } }
   ```
+
+  这一行已有别的命令时，优先用上面的 WebUI 改。要手改就把新条目加进最外层花括号，和已有条目用逗号隔开，
+  不要换行，末尾不留逗号。
 
   用户写成 `平台:账号`。想在 WebUI 的聊天室里发命令，v1.3.16 起填 `internal:owner`；更早的版本聊天室账号每个浏览器不同，
   建议放行聊天平台上的账号，在那边发。
@@ -235,8 +243,9 @@ python -m pytest
 
 `tests/test_plugin.py` 需要安装 `maibot-plugin-sdk`，没有时自动跳过；其余测试只依赖标准库与 pytest。
 平台专属的测试在别的平台上跳过；macOS 上装了 Command Line Tools 时，`tests/test_darwinproc.py` 会对照系统头文件校验结构体布局。
-CI 在 Linux、Windows 与 macOS（arm64、Intel）上跑。`tests/host_smoke.sh` 用官方镜像确认插件能加载并写出真实样本，
-推送到 `main` 时和每周各跑一次，宿主改配置键或进程结构时靠它发现。
+CI 在 Linux、Windows 与 macOS（arm64、Intel）上跑。`tests/host_smoke.sh` 用官方镜像确认插件能加载、写出真实样本、
+数据库统计能跑通、Worker 在监听 WebUI 端口，推送到 `main` 时和每周各跑一次，宿主改配置键、表结构或进程结构时靠它发现。
+公开仓库连续 60 天没有活动时 GitHub 会停用定时任务，用 `gh workflow enable host-smoke.yml` 恢复。
 
 ## 许可证
 

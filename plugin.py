@@ -681,7 +681,7 @@ class MemDiagPlugin(MaiBotPlugin):
             raise
         text = (
             f"诊断包已生成：{self._display_path(path)}（{report.human_bytes(size)}）。"
-            "包内是内存样本、统计与本插件配置（白名单只记条目数），不含聊天内容与宿主配置。"
+            "包内是内存样本、统计与本插件配置（白名单只记条目数），不含聊天内容与宿主配置文件。"
         )
         if stale:
             for old, exc in stale:
