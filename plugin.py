@@ -378,6 +378,12 @@ class MemDiagPlugin(MaiBotPlugin):
             raise RuntimeError(f"宿主配置 {key} 不可用: {value!r}")
         return value
 
+    async def _webui_port(self) -> int:
+        # v1.3.16 起 WebUI 与文件服务共用 [http]，更早的版本在 [webui]。
+        if await self.ctx.call_capability("config.get", key="http.port") is None:
+            return await self._config_value("webui.port", int)
+        return await self._config_value("http.port", int)
+
     async def _resolve_targets(self) -> Targets:
         ensure_supported_platform()
         data_dir = Path(self.ctx.paths.data_dir)
@@ -386,7 +392,7 @@ class MemDiagPlugin(MaiBotPlugin):
             # Runner 继承 Worker 的工作目录，两版都等于实例根；不一致多半是符号链接，记一笔继续按插件数据目录推。
             self.ctx.logger.warning("实例根 %s 与工作目录 %s 不一致，以插件数据目录推出的实例根为准", root, os.getcwd())
         webui_enabled = await self._config_value("webui.enabled", bool)
-        webui_port = await self._config_value("webui.port", int) if webui_enabled else None
+        webui_port = await self._webui_port() if webui_enabled else None
         amemorix_dir = await self._config_value("a_memorix.storage.data_dir", str)
         worker_pid, identity = await asyncio.to_thread(find_worker)
         main_db = await asyncio.to_thread(locate_main_db, root)

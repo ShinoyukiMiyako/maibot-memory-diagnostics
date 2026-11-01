@@ -350,6 +350,24 @@ def test_resolve_targets_reads_webui_port_only_when_enabled(instance):
     assert with_webui.db_files["main_db"] == root / "data" / "MaiBot.db"
 
 
+@pytest.mark.parametrize(("config", "expected"), [
+    ({"webui.port": 18001}, 18001),
+    ({"http.port": 18002}, 18002),
+    ({"http.port": 18002, "webui.port": 18001}, 18002),
+])
+def test_webui_port_follows_the_host_version(tmp_path, config, expected):
+    # v1.3.16 删掉了 webui.port：这里读错的话插件在新版宿主上加载不起来。
+    plugin, _ = make_plugin(tmp_path, config_values=config)
+    assert asyncio.run(plugin._webui_port()) == expected
+
+
+@pytest.mark.parametrize("config", [{"unrelated": 1}, {"http.port": "8001"}, {"webui.port": True}])
+def test_webui_port_refuses_missing_and_mistyped_values(tmp_path, config):
+    plugin, _ = make_plugin(tmp_path, config_values=config)
+    with pytest.raises(RuntimeError):
+        asyncio.run(plugin._webui_port())
+
+
 # ---- 生命周期 --------------------------------------------------------------------
 
 
