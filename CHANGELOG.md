@@ -22,5 +22,7 @@
   摘要注明未按新配置重启，白名单不受影响；与卸载并发时卸载会等旧采集真正结束。
 - `/memdiag` 回复摘要，`/memdiag pack` 在后台生成诊断包，旧包删不掉时新包照常生成并在回复里注明；
   命令需要宿主放行（受保护命令），可再按用户收窄。
-- 兼容 MaiBot 1.2.3 至 1.3.x、maibot-plugin-sdk 2.8.0 及以上；Linux 内核 4.5 之前从 `statm` 推算匿名内存。
-  真实宿主的端到端验证只在 Linux 上做过，Windows 与 macOS 只验证过采集代码。
+- 兼容 MaiBot 1.2.3 至 1.3.x、maibot-plugin-sdk 2.8.0 及以上；WebUI 端口 v1.3.16 起读 `http.port`，更早读 `webui.port`；
+  Linux 内核 4.5 之前从 `statm` 推算匿名内存。
+  真实宿主的端到端验证只在 Linux 上做过（官方 Docker 镜像 1.2.3、1.3.8、1.3.17、1.3.19 与直接运行的 1.2.3），
+  Windows 与 macOS 只验证过采集代码。

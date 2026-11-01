@@ -1,0 +1,38 @@
+name: 内存问题反馈
+description: MaiBot 内存持续上涨、被 OOM 杀掉或容器反复重启
+title: "[内存] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        诊断包的生成和取出方法见 README 的“内存有问题时怎么反馈”。Issue 是公开的，可以先解压诊断包看过再上传。
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: 部署方式
+      options:
+        - Docker
+        - Linux 直接运行
+        - Windows
+        - macOS
+    validations:
+      required: true
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 现象
+      description: 运行了多久，内存涨到多少，最后怎么结束的（OOM、容器重启、手动重启）。
+    validations:
+      required: true
+  - type: input
+    id: restart-count
+    attributes:
+      label: 容器重启次数
+      description: Docker 部署填 docker inspect --format '{{.RestartCount}}' maim-bot-core 的输出。
+  - type: textarea
+    id: pack
+    attributes:
+      label: 诊断包
+      description: 把 memdiag-*.zip 拖到这里。
+    validations:
+      required: true

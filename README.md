@@ -11,6 +11,35 @@
 
 只用 Python 标准库，不引入任何第三方依赖。
 
+## 内存有问题时怎么反馈
+
+MaiBot 运行几天到几十天后内存一路上涨、被 OOM 杀掉或被容器反复重启时，按下面做。插件从安装时才开始记录，
+越早装，看到的走势越完整。
+
+1. 安装插件，见[安装](#安装)。
+2. 放行 `/memdiag`，见[命令权限](#命令权限)。默认谁都不能用，这是宿主对受保护命令的规定。
+3. 照常使用，不用改配置。Worker 被杀后样本不会丢，重启后自动接着记录。
+4. 内存涨上去或 OOM 之后，向麦麦发 `/memdiag pack`，稍等会收到“诊断包已生成”。
+5. 取走诊断包 `memdiag-*.zip`：
+
+   | 部署方式 | 诊断包位置 |
+   | --- | --- |
+   | Docker（官方 compose） | `docker-compose.yml` 所在目录下的 `data/MaiMBot-plugin-data/shinoyuki.memdiag/packs/` |
+   | 直接运行 | `<实例根>/data/plugins/shinoyuki.memdiag/packs/` |
+
+   Docker 下回复里的路径 `data/plugins/...` 是容器内路径，到宿主机上按上表找。WebUI 下载不了诊断包。
+6. 到本仓库的 Issues 选“内存问题反馈”，把诊断包拖进去，写明运行了多久、内存涨到多少。
+
+   Docker 部署再附上重启次数，OOM 后容器恢复运行时 `OOMKilled` 会变回 `false`，这个数不会：
+
+   ```bash
+   docker inspect --format '{{.RestartCount}}' maim-bot-core
+   ```
+
+Issue 是公开的。诊断包里是内存读数、文件大小、各表行数与消息量、版本信息和本插件配置，以及 v1.3.13 起宿主自带的
+内存诊断日志；没有聊天内容、宿主配置、API Key 和客户端 IP。`cgroup.path` 可能带容器 ID。
+里面都是 JSON 文本，可以解压看过再发。
+
 ## 兼容性
 
 | 项目 | 范围 |
@@ -22,8 +51,9 @@
 | macOS | 进程内存（主指标是物理占用 `phys_footprint`，峰值也按它算）、线程数、子进程、文件大小、数据库统计照常；没有 smaps、glibc 堆估计、cgroup、fd、正在退出的进程数与全部 WebUI 连接信息 |
 | 其他 | 不支持，插件加载时直接报错 |
 
-真实宿主上的端到端验证只在 Linux 上做过。Windows 与 macOS 上跑过采集代码的全部测试（macOS 为 GitHub Actions 的
-arm64 与 Intel 机器，读的是真实进程），没有在真实宿主里运行过。
+真实宿主上的端到端验证只在 Linux 上做过：官方 Docker 镜像 1.2.3、1.3.8、1.3.17、1.3.19（含容器 OOM 后恢复采集），
+以及直接运行的 1.2.3。Windows 与 macOS 上跑过采集代码的全部测试（macOS 为 GitHub Actions 的 arm64 与 Intel 机器，
+读的是真实进程），没有在真实宿主里运行过。
 
 macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，这段时间没有样本；停住约 35 秒起，
 宿主的健康检查可能重启 Runner。继续运行后采集照常。附加期间 Runner 的父进程号是调试器，认不出 Worker：
@@ -31,23 +61,30 @@ macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，
 
 ## 安装
 
-1. 把本仓库放到 MaiBot 实例根目录的 `plugins/` 下，例如 `plugins/maibot-memory-diagnostics/`
-   （目录里要直接有 `_manifest.json` 与 `plugin.py`）。
-2. 重启 MaiBot。宿主会在插件目录里生成 `config.toml`，插件默认启用，加载后立即开始采集。
-3. 日志里出现 `内存诊断开始采集：Worker pid=...` 即表示正常运行。
+先下载本仓库：页面上的 Code → Download ZIP。
+
+- WebUI（v1.3.8 起）：在插件配置页选“从 ZIP 安装插件”，上传这个 ZIP，不用解压，然后按提示重启麦麦。
+- 手动（所有版本）：解压后把目录放进插件目录，目录里要直接有 `_manifest.json` 与 `plugin.py`，然后重启麦麦。
+  插件目录直接运行时是 `<实例根>/plugins/`，Docker（官方 compose）是 `docker-compose.yml` 所在目录下的 `data/MaiMBot/plugins/`。
+
+宿主会在插件目录里生成 `config.toml`，插件默认启用，加载后立即开始采集。
+日志里出现 `内存诊断开始采集：Worker pid=...` 即表示正常运行，WebUI 的日志页也能看到。
 
 ### 命令权限
 
 `/memdiag` 是宿主意义上的受保护（operator）命令，宿主按下面任一条放行：
 
-- 宿主自带的本地操作员终端（`bot_console` 平台）始终可用。
+- 宿主自带的本地操作员终端（`bot_console` 平台）始终可用。它需要交互式终端，Docker 默认没有。
 - 只放行本命令（推荐）：在 WebUI“麦麦设置”页的“命令管理”标签里选 `/memdiag`（插件 `shinoyuki.memdiag`，可搜 `memdiag`），
-  填写“仅为此命令放行用户”；或在 MaiBot 的 `bot_config.toml` 里写：
+  填写“仅为此命令放行用户”，保存后立即生效，不用重启；或在 MaiBot 的 `bot_config.toml` 里写：
 
   ```toml
   [plugin.command_permissions."shinoyuki.memdiag.memdiag"]
   allow_users = ["qq:123456789"]
   ```
+
+  用户写成 `平台:账号`。想在 WebUI 的聊天室里发命令，v1.3.16 起填 `internal:owner`；更早的版本聊天室账号每个浏览器不同，
+  建议放行聊天平台上的账号，在那边发。
 
   同一处还有 `allow_chats`（聊天流 ID）。放行聊天后，该聊天里的任何人都能执行本命令，包括 `/memdiag pack`。
 - `bot_config.toml` 的 `[plugin].permission`：列在这里的用户能执行所有受保护命令，包括用 `/pm` 加载、重载插件，
@@ -118,7 +155,8 @@ cgroup 按 `mountinfo` 找挂载点，兼容 Docker 的私有与共享 cgroup �
 
 ## 输出文件
 
-都在 `<实例根>/data/plugins/shinoyuki.memdiag/` 下：
+都在 `<实例根>/data/plugins/shinoyuki.memdiag/` 下，Docker（官方 compose）在 `docker-compose.yml` 所在目录下的
+`data/MaiMBot-plugin-data/shinoyuki.memdiag/`：
 
 | 文件 | 内容 |
 | --- | --- |
@@ -142,6 +180,9 @@ Windows 上样本文件正被别的程序打开（例如正在打包，或 `Get-
 每条 `trend` 与 `db` 记录带 `wid`（Worker 的 pid 与启动时间）。Worker 重启后插件会停止采集并写一条
 `stop` 记录；宿主重新拉起插件后以新的 `wid` 继续，分析时按 `wid` 分段。
 
+Worker 连同插件一起被杀时来不及写 `stop`：Docker 里 OOM 会让整个容器重启，样本里表现为 `wid` 变了、前面没有 `stop`，
+而且 pid 常常不变，要比启动时间。最后一条样本在被杀前的一个采样间隔内。
+
 ## 怎么看
 
 主指标是 Linux 的匿名内存（`RssAnon`）、Windows 的提交内存（private usage）、macOS 的物理占用（`phys_footprint`）。
@@ -159,7 +200,8 @@ Windows 上样本文件正被别的程序打开（例如正在打包，或 `Get-
 - 被观测的文件持续变大：宿主若会整份读写这个文件，每次读写的内存峰值会随文件大小一起涨。
 - `rpc_ms` 经常上百毫秒，或频繁出现 `rpc_pending_s`：Worker 主事件循环被阻塞，常与大文件读写、
   大查询同时出现。Worker 卡住超过 10 分钟时要把 `rpc_pending_s` 与 `E_TIMEOUT` 的 `rpc_error` 连起来看。
-- `cgroup.events.oom_kill` 增加：容器或服务的内存上限触发过 OOM。
+- `cgroup.events.oom_kill` 增加：容器或服务的内存上限触发过 OOM。容器重启后 cgroup 是新的，计数归零，
+  所以没增加不代表没发生过：还要看 `wid` 有没有变、`RestartCount` 有没有涨。
 
 摘要里的“近 N 小时增长”取的是不晚于 N 小时前的最后一个点。插件重载或 Runner 重启后，
 历史从趋势文件里同一个 Worker 的记录恢复（刚轮转过时会多读一个旧文件）。中间停过采集（插件停用后重新启用）时，
@@ -193,7 +235,8 @@ python -m pytest
 
 `tests/test_plugin.py` 需要安装 `maibot-plugin-sdk`，没有时自动跳过；其余测试只依赖标准库与 pytest。
 平台专属的测试在别的平台上跳过；macOS 上装了 Command Line Tools 时，`tests/test_darwinproc.py` 会对照系统头文件校验结构体布局。
-CI 在 Linux、Windows 与 macOS（arm64、Intel）上跑。
+CI 在 Linux、Windows 与 macOS（arm64、Intel）上跑。`tests/host_smoke.sh` 用官方镜像确认插件能加载并写出真实样本，
+推送到 `main` 时和每周各跑一次，宿主改配置键或进程结构时靠它发现。
 
 ## 许可证
 
