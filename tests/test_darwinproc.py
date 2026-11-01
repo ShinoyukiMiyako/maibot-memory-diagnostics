@@ -89,6 +89,8 @@ class FakeLibproc:
             return (len(self.pids) + 1) * 4
         for index, pid in enumerate(self.pids):
             buffer[index] = pid
+        # 返回值是字节数不是个数：写入范围之外的内容不能被当成 pid。
+        buffer[len(self.pids)] = 99
         return len(self.pids) * 4
 
     def proc_pidinfo(self, pid, flavor, arg, buffer, size):
