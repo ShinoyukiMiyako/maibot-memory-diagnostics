@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 在官方镜像里加载插件，确认采集真的开始了。单元测试用的是替身，发现不了宿主改配置键或改进程结构这类问题。
+# 在官方镜像里加载插件，确认采集真的开始了。单元测试用的是替身，发现不了宿主改配置键、表结构或进程结构这类问题。
 # 用法（在仓库根目录）: bash tests/host_smoke.sh sengokucola/maibot:latest
 set -euo pipefail
 
@@ -54,24 +54,60 @@ for _ in $(seq 1 60); do
     sleep 3
 done
 started || fail "等不到采集开始"
-[ -s "$trend" ] || fail "没有写出趋势记录"
+[ -s "$trend" ] || fail "趋势文件是空的"
 
 # 容器里的 Python 版本才是插件的运行环境；样本要有真实读数，只写出文件不算过。
-docker exec -i "$name" /MaiMBot/.venv/bin/python - <<'PY'
+docker exec -i "$name" /MaiMBot/.venv/bin/python - <<'PY' || fail "容器内检查失败"
+import importlib.util
 import json
+import threading
 import time
 from pathlib import Path
 
 base = Path("/MaiMBot/data/plugins/shinoyuki.memdiag")
-deadline = time.monotonic() + 30
-while not (base / "fast.jsonl").exists():
-    assert time.monotonic() < deadline, "等不到快速样本"
-    time.sleep(1)
-records = [json.loads(line) for line in (base / "trend.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
-assert records[0]["k"] == "meta", records[0]
-assert records[0]["webui_port"] is None or records[0]["webui_port"] > 0
-sample = json.loads((base / "fast.jsonl").read_text(encoding="utf-8").splitlines()[0])
+
+
+def records(name):
+    path = base / name
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    return [json.loads(line) for line in text.splitlines()]
+
+
+def wait_for(found, seconds, message):
+    deadline = time.monotonic() + seconds
+    while not found():
+        assert time.monotonic() < deadline, message
+        time.sleep(1)
+
+
+wait_for(lambda: records("fast.jsonl"), 30, "等不到快速样本")
+# meta 在第一轮趋势之前写出，趋势轮失败时文件里只有 meta 和 error。
+wait_for(lambda: any(record["k"] in ("trend", "error") for record in records("trend.jsonl")), 30, "等不到趋势轮结果")
+trend = records("trend.jsonl")
+meta = trend[0]
+assert meta["k"] == "meta", meta
+assert meta["webui_port"] is None or meta["webui_port"] > 0
+assert not [record for record in trend if record["k"] == "error"], trend
+db = next(record for record in trend if record["k"] == "trend")["db"]
+# 宿主改表名时这些键会被悄悄跳过，改列名时上面的 error 会拦下。
+assert db["page_count"] > 0 and {"mai_messages_max_id", "llm_usage_max_id", "expressions_max_id"} <= db.keys(), db
+
+sample = records("fast.jsonl")[0]
 assert sample["worker"]["primary"] > 0 and sample["worker"]["rss"] > 0, sample
 assert "plugin_runner" in sample["children"], sample["children"]
-print("PASS", records[0]["host_version"], records[0]["python"], "webui_port", records[0]["webui_port"], "worker", records[0]["worker_pid"])
+# 监听状态按 Worker 持有的 socket 判定，认错 Worker 或读错端口时一直是 False。
+# 不能只看第一条：1.2.3 的 WebUI 在插件加载之后才启动。
+if meta["webui_port"] is not None:
+    wait_for(lambda: any(sample["webui"]["listening"] for sample in records("fast.jsonl")), 120, "Worker 没有监听 WebUI 端口")
+
+# 总量统计要等 trend_interval_sec 才第一次跑，冒烟等不到。列名对不上时打包直接失败，约 4 小时后采集也会停；空库上就能发现。
+spec = importlib.util.spec_from_file_location("dbstats", "/MaiMBot/plugins/maibot-memory-diagnostics/dbstats.py")
+dbstats = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(dbstats)
+main_db = Path("/MaiMBot/data/MaiBot.db")
+cancel = threading.Event()
+stats = dbstats.heavy_stats(main_db, dbstats.existing_tables(main_db, 5000, cancel=cancel), 5000, cancel=cancel)
+expected = {"mai_messages_total", "llm_usage_total", "expressions_total", "images_by_type", "jargon_evidence_bytes", "msg_30d_approx"}
+assert expected <= stats.keys(), stats
+print("PASS", meta["host_version"], meta["python"], "webui_port", meta["webui_port"], "worker", meta["worker_pid"])
 PY
