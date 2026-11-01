@@ -340,13 +340,18 @@ def test_resolve_targets_reads_webui_port_only_when_enabled(instance):
     root, data_dir = instance
     enabled, _ = make_plugin(data_dir, config_values={**DEFAULT_HOST_CONFIG, "webui.enabled": True, "webui.port": 18001})
     disabled, _ = make_plugin(data_dir)
+    # v1.3.16 起的宿主只有 http.port。
+    new_host, _ = make_plugin(data_dir, config_values={
+        "webui.enabled": True, "http.port": 18002, "a_memorix.storage.data_dir": "data/a-memorix",
+    })
 
     async def scenario():
-        return await enabled._resolve_targets(), await disabled._resolve_targets()
+        return await enabled._resolve_targets(), await disabled._resolve_targets(), await new_host._resolve_targets()
 
-    with_webui, without_webui = asyncio.run(scenario())
+    with_webui, without_webui, on_new_host = asyncio.run(scenario())
     assert with_webui.webui_port == 18001
     assert without_webui.webui_port is None
+    assert on_new_host.webui_port == 18002
     assert with_webui.db_files["main_db"] == root / "data" / "MaiBot.db"
 
 
