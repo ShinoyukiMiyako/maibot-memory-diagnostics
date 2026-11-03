@@ -1,6 +1,9 @@
+import gc
+import importlib.util
 import os
 import subprocess
 import sys
+import weakref
 
 import pytest
 
@@ -133,6 +136,20 @@ def test_process_memory_reports_positive_counters_for_self():
     assert result["private_usage"] > 0
     assert result["peak_working_set"] >= result["working_set"]
     assert result["handle_count"] > 0
+
+
+@windows_only
+def test_reloaded_module_releases_its_structure_classes():
+    # 宿主重载插件时把插件模块移出 sys.modules 再重新执行，每次都会生成新的结构体类；旧类必须能被回收。
+    spec = importlib.util.spec_from_file_location("memdiag_winproc_reload_probe", os.path.join(PLUGIN_DIR, "winproc.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.process_memory(os.getpid())
+    module.process_table()
+    classes = [weakref.ref(module.PROCESS_MEMORY_COUNTERS_EX), weakref.ref(module.PROCESSENTRY32W)]
+    del module, spec
+    gc.collect()
+    assert [ref() for ref in classes] == [None, None]
 
 
 @windows_only
