@@ -10,10 +10,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+import heapq
 import os
 import re
 
 PROC = Path("/proc")
+THP_SYSFS = Path("/sys/kernel/mm/transparent_hugepage")
 
 STATUS_KEYS = ("VmRSS", "VmHWM", "RssAnon", "RssFile", "RssShmem", "VmSwap", "Threads")
 # glibc 非主 arena 的堆按 HEAP_MAX_SIZE 对齐映射（64 位为 64 MiB），用完的部分 rw-p、保留的尾部 ---p。
@@ -23,6 +25,13 @@ TCP_STATE_LISTEN = "0A"
 # /proc/net/tcp 的 tr 字段：4 表示零窗口探测定时器，对端停止读取且接收窗口为 0 时出现。
 TCP_TIMER_ZERO_WINDOW_PROBE = 4
 RUNNER_MODULE = "src.plugin_runtime.runner.runner_main"
+SMAPS_HEADER = re.compile(r"[0-9a-f]+-[0-9a-f]+ ")
+# 没有名字的匿名映射按大小分档（KiB）：pymalloc 的 arena 是 1 MiB 的映射，超过 mmap 阈值的大块分配从 128 KiB 起。
+ANON_SIZE_CLASSES = ((2 * 1024, "lt_2m"), (64 * 1024, "2m_to_64m"), (None, "ge_64m"))
+# 最大的几个匿名映射单独列出，看是不是某一块大缓冲区（向量索引、大数组）在长。
+LARGEST_ANON_MAPS = 5
+# 带名字的匿名映射（[anon:名字]）按名字单列；名字由程序自己起，个数不设限的话一条记录可能很长。
+NAMED_ANON_LIMIT = 10
 CGROUP_V2_STAT_KEYS = ("anon", "file", "kernel", "kernel_stack", "slab", "sock", "shmem", "file_mapped")
 CGROUP_V1_STAT_KEYS = ("rss", "cache", "mapped_file", "swap", "total_rss", "total_cache")
 
@@ -161,6 +170,112 @@ def glibc_heap_estimate(maps_text: str) -> Dict[str, int]:
     }
 
 
+def parse_smaps(text: str) -> List[Dict[str, Any]]:
+    """/proc/<pid>/smaps 的逐个映射：首行与 maps 的一行相同，其后是这个映射的各项 KiB 字段与 VmFlags。
+
+    3.8 之前的内核没有 VmFlags，flags 为 None。
+    """
+    maps: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        if SMAPS_HEADER.match(line):
+            fields = line.split(None, 5)
+            start, end = (int(part, 16) for part in fields[0].split("-"))
+            maps.append({
+                "start": start, "end": end, "perms": fields[1], "path": fields[5] if len(fields) > 5 else "",
+                "kb": {}, "flags": None,
+            })
+            continue
+        key, sep, value = line.partition(":")
+        if not sep or not maps:
+            continue
+        if key == "VmFlags":
+            maps[-1]["flags"] = value.split()
+            continue
+        parts = value.split()
+        if len(parts) == 2 and parts[1] == "kB":
+            maps[-1]["kb"][key] = int(parts[0])
+    return maps
+
+
+def maps_text_of(smaps_text: str) -> str:
+    """smaps 里每个映射的首行就是 maps 的一行；读过 smaps 就不必再读一遍 maps。"""
+    return "\n".join(line for line in smaps_text.splitlines() if SMAPS_HEADER.match(line))
+
+
+def _anon_bucket() -> Dict[str, int]:
+    return {"maps": 0, "rss_kb": 0, "anon_kb": 0, "thp_kb": 0}
+
+
+def _is_glibc_heap(mapping: Dict[str, Any]) -> bool:
+    """glibc 用 MAP_NORESERVE 预留线程堆，VmFlags 里带 nr；紧挨着的两个线程堆会被内核合并成一段超过 64 MiB 的映射，
+    这时只能靠 nr 认。overcommit_memory=2 时不设这个标志，3.8 之前的内核没有 VmFlags，所以也按 64 MiB 对齐认。"""
+    flags = mapping["flags"]
+    if flags is not None and "nr" in flags:
+        return True
+    return mapping["start"] % GLIBC_HEAP_MAX_SIZE == 0 and mapping["end"] - mapping["start"] <= GLIBC_HEAP_MAX_SIZE
+
+
+def anon_breakdown(maps: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """按映射种类汇总常驻的匿名内存，分辨涨的是 malloc 的堆，还是堆外独立的大块映射。
+
+    brk_heap 是主 arena（[heap]）；glibc_arenas 是线程堆（自带 jemalloc、mimalloc 的扩展也用 MAP_NORESERVE，
+    会算在这里）。SQLite 页缓存、小于 mmap 阈值的分配，以及释放后没还给系统的内存都在这两类里。
+    other 是其余没有名字的匿名映射，按映射大小分档：pymalloc 的 arena、超过 mmap 阈值的大块分配（faiss 索引、
+    numpy 数组等）在这里；内核会合并相邻的同权限匿名映射，大小分档只是粗分。带名字的匿名映射（[stack]、[anon:名字]）
+    按名字单列。不记地址与文件路径。
+    """
+    other = {name: _anon_bucket() for _, name in ANON_SIZE_CLASSES}
+    result: Dict[str, Any] = {"brk_heap": _anon_bucket(), "glibc_arenas": _anon_bucket(), "other": other}
+    named: Dict[str, Dict[str, int]] = {}
+    ranked: List[Tuple[int, str, int, Dict[str, int]]] = []
+    for mapping in maps:
+        path = mapping["path"]
+        anonymous = path in ("", "[heap]") or path.startswith(("[stack", "[anon:"))
+        # 不可访问的映射（线程堆的保留尾、栈保护页）不占内存。
+        if not anonymous or mapping["perms"].startswith("---"):
+            continue
+        size_kb = (mapping["end"] - mapping["start"]) // 1024
+        if path == "[heap]":
+            kind, bucket = "brk_heap", result["brk_heap"]
+        elif path:
+            # 4.5 之前的内核把线程栈记作 [stack:线程号]，并成一项，免得每个线程各占一个名字。
+            kind = "[stack]" if path.startswith("[stack") else path
+            bucket = named.setdefault(kind, _anon_bucket())
+        elif mapping["perms"] == "rw-p" and _is_glibc_heap(mapping):
+            kind, bucket = "glibc_arena", result["glibc_arenas"]
+        else:
+            kind = next(name for limit, name in ANON_SIZE_CLASSES if limit is None or size_kb < limit)
+            bucket = other[kind]
+        kb = mapping["kb"]
+        # 内核没编进透明大页时没有 AnonHugePages 这一项，也就没有大页。
+        values = {"rss_kb": kb["Rss"], "anon_kb": kb["Anonymous"], "thp_kb": kb.get("AnonHugePages", 0)}
+        bucket["maps"] += 1
+        for key, value in values.items():
+            bucket[key] += value
+        ranked.append((values["rss_kb"], kind, size_kb, values))
+    kept = sorted(named.items(), key=lambda item: -item[1]["rss_kb"])
+    result["named"] = dict(kept[:NAMED_ANON_LIMIT])
+    if len(kept) > NAMED_ANON_LIMIT:
+        rest = _anon_bucket()
+        for _, bucket in kept[NAMED_ANON_LIMIT:]:
+            for key in rest:
+                rest[key] += bucket[key]
+        result["named"]["_rest"] = rest
+    result["largest"] = [
+        {"kind": kind, "size_kb": size_kb, **values}
+        for _, kind, size_kb, values in heapq.nlargest(LARGEST_ANON_MAPS, ranked, key=lambda item: item[0])
+    ]
+    return result
+
+
+def parse_thp_mode(text: str) -> str:
+    """sysfs 里透明大页的开关形如 "always [madvise] never"，方括号里是当前选中的那项。"""
+    match = re.search(r"\[([^\]]+)\]", text)
+    if match is None:
+        raise ValueError(f"无法识别的透明大页设置: {text!r}")
+    return match.group(1)
+
+
 def _unescape_mount_field(value: str) -> str:
     # mountinfo 把空格、制表符、换行与反斜杠写成三位八进制转义。
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
@@ -245,6 +360,13 @@ def parse_limit(text: str) -> Optional[int]:
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
+
+
+def thp_settings() -> Optional[Dict[str, str]]:
+    """系统的透明大页设置；内核没编进 THP 时没有这个目录，返回 None。容器里看到的是宿主机内核的设置。"""
+    if not THP_SYSFS.is_dir():
+        return None
+    return {name: parse_thp_mode(read_text(THP_SYSFS / name)) for name in ("enabled", "defrag")}
 
 
 def process_snapshot(pid: int) -> Dict[str, int]:

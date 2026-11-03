@@ -272,10 +272,19 @@ class Collector:
         if IS_LINUX:
             pid = self.targets.worker_pid
             proc = procfs.PROC / str(pid)
-            # smaps_rollup 与 maps 读取时持有 Worker 的 mmap 读锁，只在趋势节拍读；4.14 之前的内核没有 smaps_rollup。
+            # smaps_rollup 与 smaps 都要遍历 Worker 的页表，读取时持有它的 mmap 读锁，只在趋势节拍读；
+            # 4.14 之前的内核没有 smaps_rollup。
             rollup = proc / "smaps_rollup"
             record["smaps"] = procfs.parse_smaps_rollup(procfs.read_text(rollup)) if rollup.exists() else None
-            record["heap"] = procfs.glibc_heap_estimate(procfs.read_text(proc / "maps"))
+            smaps = proc / "smaps"
+            if smaps.exists():
+                smaps_text = procfs.read_text(smaps)
+                record["heap"] = procfs.glibc_heap_estimate(procfs.maps_text_of(smaps_text))
+                record["anon_maps"] = procfs.anon_breakdown(procfs.parse_smaps(smaps_text))
+            else:
+                # 内核没开 CONFIG_PROC_PAGE_MONITOR 时没有 smaps，线程堆只能从 maps 估。
+                record["heap"] = procfs.glibc_heap_estimate(procfs.read_text(proc / "maps"))
+                record["anon_maps"] = None
             record["fds"] = procfs.fd_summary(pid, self.targets.db_files)
             record["cgroup"] = procfs.cgroup_memory(pid)
             if self.targets.webui_port is not None:
@@ -311,6 +320,8 @@ class Collector:
                 (procfs.PROC / str(self.targets.worker_pid) / "environ").read_bytes(), WORKER_ENV_WHITELIST
             )
             record["cgroup"] = procfs.cgroup_memory(self.targets.worker_pid)
+            # 透明大页设为 always 时，碎片化的堆按 2 MiB 整页常驻，同样的分配占的内存更多。
+            record["thp"] = procfs.thp_settings()
         if IS_DARWIN:
             record["kernel"] = os.uname().release
             record["macos"] = platform.mac_ver()[0]
@@ -352,6 +363,21 @@ def file_stats(files: Dict[str, Path]) -> Dict[str, Optional[Dict[str, float]]]:
             result[name] = None
             continue
         result[name] = {"size": stat.st_size, "mtime": round(stat.st_mtime, 3)}
+    return result
+
+
+def file_list(directory: Path, pattern: str) -> Optional[List[Dict[str, Any]]]:
+    """目录下匹配 pattern 的每个文件：相对路径、大小与修改时间；目录不存在记 None。"""
+    if not directory.is_dir():
+        return None
+    result: List[Dict[str, Any]] = []
+    for path in sorted(directory.glob(pattern)):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            # 列举之后被删除（例如向量空间切换后清理旧目录）。
+            continue
+        result.append({"path": path.relative_to(directory).as_posix(), "size": stat.st_size, "mtime": round(stat.st_mtime, 3)})
     return result
 
 

@@ -88,9 +88,13 @@ meta = trend[0]
 assert meta["k"] == "meta", meta
 assert meta["webui_port"] is None or meta["webui_port"] > 0
 assert not [record for record in trend if record["k"] == "error"], trend
-db = next(record for record in trend if record["k"] == "trend")["db"]
+first = next(record for record in trend if record["k"] == "trend")
+db = first["db"]
 # 宿主改表名时这些键会被悄悄跳过，改列名时上面的 error 会拦下。
 assert db["page_count"] > 0 and {"mai_messages_max_id", "llm_usage_max_id", "expressions_max_id"} <= db.keys(), db
+# smaps 的格式没认对时各类读数全是 0。
+assert first["anon_maps"]["brk_heap"]["rss_kb"] > 0, first["anon_maps"]
+assert "thp" in meta and "amemorix_faiss_index" in first["dirs"], (sorted(meta), first["dirs"])
 
 sample = records("fast.jsonl")[0]
 assert sample["worker"]["primary"] > 0 and sample["worker"]["rss"] > 0, sample

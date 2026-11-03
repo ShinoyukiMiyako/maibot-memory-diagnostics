@@ -47,9 +47,9 @@ MaiBot 运行几天到几十天后内存一路上涨、被 OOM 杀掉或被容�
 | --- | --- |
 | MaiBot 宿主 | 1.2.3 至 1.3.x |
 | maibot-plugin-sdk | 2.8.0 及以上 |
-| Linux | 全部功能；4.5 之前的内核从 `statm` 推算匿名内存，4.14 之前的内核没有 `smaps_rollup`（记为 `null`） |
-| Windows | 进程内存、子进程、文件大小、数据库统计照常；没有 smaps、glibc 堆估计、cgroup、fd、线程数、正在退出的进程数与全部 WebUI 连接信息，另记句柄数 `handles` |
-| macOS | 进程内存（主指标是物理占用 `phys_footprint`，峰值也按它算）、线程数、子进程、文件大小、数据库统计照常；没有 smaps、glibc 堆估计、cgroup、fd、正在退出的进程数与全部 WebUI 连接信息 |
+| Linux | 全部功能；4.5 之前的内核从 `statm` 推算匿名内存，4.14 之前的内核没有 `smaps_rollup`（记为 `null`），没开 `CONFIG_PROC_PAGE_MONITOR` 的内核没有 `anon_maps`（记为 `null`） |
+| Windows | 进程内存、子进程、文件大小、数据库统计照常；没有 smaps、匿名映射分类、glibc 堆估计、透明大页设置、cgroup、fd、线程数、正在退出的进程数与全部 WebUI 连接信息，另记句柄数 `handles` |
+| macOS | 进程内存（主指标是物理占用 `phys_footprint`，峰值也按它算）、线程数、子进程、文件大小、数据库统计照常；没有 smaps、匿名映射分类、glibc 堆估计、透明大页设置、cgroup、fd、正在退出的进程数与全部 WebUI 连接信息 |
 | 其他 | 不支持，插件加载时直接报错 |
 
 真实宿主上的端到端验证只在 Linux 上做过：官方 Docker 镜像 1.2.3、1.3.8、1.3.17、1.3.19（含容器 OOM 后恢复采集），
@@ -121,14 +121,14 @@ macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，
 | 档位 | 默认间隔 | 内容 |
 | --- | --- | --- |
 | 快速样本 `fast` | 15 秒 | Worker 的 RSS、匿名内存（Windows 为提交内存，macOS 为物理占用）、峰值、线程数（Windows 为句柄数）；按可执行文件名汇总的子进程内存（Linux 上插件 Runner、Chromium 各归一类，另计正在退出的进程数；Windows 与 macOS 按小写的文件名分桶，Runner 算在解释器名下）；Runner 自身内存；WebUI 端口上 Worker 的连接数、发送队列、疑似停止读取的连接数；一次到 Worker 的 RPC 往返耗时 |
-| 趋势记录 `trend` | 5 分钟 | 自上一条趋势记录以来快速样本的最小/最大/末值（上一轮没写成时并进这一条，`window.samples` 相应变多）；`smaps_rollup`；glibc 线程堆估计；fd 分类与主库、元数据库的打开数；cgroup 用量、上限与 OOM 计数；逐条 WebUI 连接；关键文件与目录大小；主库轻量统计（页数、各表最大 id、新增消息数） |
+| 趋势记录 `trend` | 5 分钟 | 自上一条趋势记录以来快速样本的最小/最大/末值（上一轮没写成时并进这一条，`window.samples` 相应变多）；`smaps_rollup`；按映射种类分的匿名内存 `anon_maps`；glibc 线程堆估计；fd 分类与主库、元数据库的打开数；cgroup 用量、上限与 OOM 计数；逐条 WebUI 连接；关键文件与目录大小；主库轻量统计（页数、各表最大 id、新增消息数） |
 | 数据库总量 `db` | 1 小时 | 消息总数、图片按类型计数、黑话证据体量、近 30 天消息量（小时聚合表加未聚合尾部的近似值） |
 
 黑话证据体量在 SQLite 3.43 及以后是字节数；更早的 SQLite 没有 `octet_length`，记的是字符数（中文为主时明显小于字节数），
 以 `meta` 里的 `sqlite` 版本为准。
 
 每次开始采集时还会写一条 `meta`：平台、Python 与 SQLite 版本、宿主版本、插件配置（白名单只记条目数）。
-Linux 上另有内核与 glibc 版本、cgroup、Worker 环境里与分配器有关的变量（`worker_env`，只取 `MALLOC_ARENA_MAX`、
+Linux 上另有内核与 glibc 版本、cgroup、透明大页设置（`thp`，容器里看到的是宿主机内核的设置）、Worker 环境里与分配器有关的变量（`worker_env`，只取 `MALLOC_ARENA_MAX`、
 `MALLOC_TRIM_THRESHOLD_`、`MALLOC_MMAP_THRESHOLD_`、`MALLOC_TOP_PAD_`、`MALLOC_MMAP_MAX_`、`GLIBC_TUNABLES`、`PYTHONMALLOC`
 这几个键，其他变量不记）；macOS 上另有内核与系统版本。Windows 与 macOS 不读 Worker 的环境，`worker_env` 这个键不存在，
 不代表这些变量没设置。
@@ -150,6 +150,11 @@ cgroup 按 `mountinfo` 找挂载点，兼容 Docker 的私有与共享 cgroup �
 - `data/local_store.json`
 - 主库 `data/MaiBot.db` 与 A_Memorix 元数据库，以及它们的 `-wal`、`-shm`
 - `logs/app_*.log.jsonl` 与 `logs/llm_cache_stats/` 的文件数与总大小
+- A_Memorix 数据目录下全部 faiss 索引（`**/*.index`）的个数与总大小（`dirs.amemorix_faiss_index`）。
+  当前向量空间的索引整个加载进 Worker，常驻内存与文件大小相当，默认双池时每个空间两个文件；
+  换过嵌入模型后留在磁盘上的旧空间、旧图片指纹目录也算在总数里，所以总数只是上限。诊断包的 `meta.json`
+  另有逐个文件的相对路径、大小与修改时间（`amemorix_faiss_indexes`）；有向量空间的版本（1.3.x）里，
+  当前空间记在 `vectors/active.json`
 
 ### 不会做的事
 
@@ -205,6 +210,14 @@ Worker 连同插件一起被杀时来不及写 `stop`：Docker 里 OOM 会让整
   网络中断后连接未断开），服务端会为它缓存待发数据。
 - `heap.heaps` 很多、`reserved_kb` 远大于 `committed_kb`：glibc 为很多线程各开了 arena；
   `meta.worker_env` 里可以看到是否设置了 `MALLOC_ARENA_MAX`。
+- `anon_maps` 把常驻的匿名内存分成主堆 `brk_heap`、线程堆 `glibc_arenas`、其余没有名字的映射 `other`
+  （按映射大小分 `lt_2m`、`2m_to_64m`、`ge_64m` 三档）和带名字的映射 `named`，`largest` 是最大的 5 块。
+  涨在前两类：malloc 分出去的内存在涨，SQLite 页缓存、小对象和释放后没还给系统的内存都在这里，
+  对照 `meta.worker_env` 的 `MALLOC_ARENA_MAX` 与 `meta.thp`（`always` 时碎片化的堆按 2 MiB 整页常驻）。
+  涨在 `other`，或 `largest` 里某一块一直变大：堆外的大块缓冲区在长，pymalloc 的 arena、faiss 索引、
+  numpy 数组都在这里，对照 `dirs.amemorix_faiss_index`。线程堆按 `VmFlags` 里的 `nr` 认（3.8 之前的内核
+  与 `overcommit_memory=2` 时退回按 64 MiB 对齐认），自带 jemalloc、mimalloc 的扩展也会算进线程堆；
+  内核会合并相邻的同权限匿名映射，`other` 的大小分档只是粗分。
 - 被观测的文件持续变大：宿主若会整份读写这个文件，每次读写的内存峰值会随文件大小一起涨。
 - `rpc_ms` 经常上百毫秒，或频繁出现 `rpc_pending_s`：Worker 主事件循环被阻塞，常与大文件读写、
   大查询同时出现。Worker 卡住超过 10 分钟时要把 `rpc_pending_s` 与 `E_TIMEOUT` 的 `rpc_error` 连起来看。

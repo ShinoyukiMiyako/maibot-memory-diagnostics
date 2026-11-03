@@ -25,7 +25,7 @@ import traceback
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
 
 from . import dbstats, report, storage
-from .collector import PRIMARY_LABEL, Collector, Targets, WorkerGone, ensure_supported_platform, find_worker
+from .collector import PRIMARY_LABEL, Collector, Targets, WorkerGone, ensure_supported_platform, file_list, find_worker
 
 PLUGIN_VERSION = "0.1.0"
 FAST_STEM = "fast"
@@ -396,6 +396,7 @@ class MemDiagPlugin(MaiBotPlugin):
         amemorix_dir = await self._config_value("a_memorix.storage.data_dir", str)
         worker_pid, identity = await asyncio.to_thread(find_worker)
         main_db = await asyncio.to_thread(locate_main_db, root)
+        amemorix_db = amemorix_metadata_db(root, amemorix_dir)
         logs = root / "logs"
         return Targets(
             worker_pid=worker_pid,
@@ -411,10 +412,13 @@ class MemDiagPlugin(MaiBotPlugin):
                 "statistics_report": statistics_report_path(root),
                 "local_store": root / "data" / "local_store.json",
             },
-            db_files={"main_db": main_db, "amemorix_db": amemorix_metadata_db(root, amemorix_dir)},
+            db_files={"main_db": main_db, "amemorix_db": amemorix_db},
             watched_dirs={
                 "app_logs": (logs, "app_*.log.jsonl"),
                 "llm_cache_stats": (logs / "llm_cache_stats", "*"),
+                # 当前向量空间的 faiss 索引整个加载进 Worker，常驻内存与 vectors.index 相当；
+                # 换过嵌入模型后留在磁盘上的旧空间、旧图片指纹目录也匹配，总数只是上限。
+                "amemorix_faiss_index": (amemorix_db.parents[1], "**/*.index"),
             },
         )
 
@@ -713,6 +717,8 @@ class MemDiagPlugin(MaiBotPlugin):
             "summary": summary,
             "config": config,
             "db_heavy": dbstats.heavy_stats(targets.db_files["main_db"], tables, limit_ms, cancel=cancel),
+            # 趋势记录里只有总数；逐个列出才分得清哪些是当前向量空间的索引，哪些是换模型后留在磁盘上的旧空间。
+            "amemorix_faiss_indexes": file_list(*targets.watched_dirs["amemorix_faiss_index"]),
         }
         memory_dir = targets.instance_root / "logs" / "memory_diagnostics"
         host_logs = sorted(memory_dir.glob("memory.jsonl*")) if memory_dir.is_dir() else []

@@ -52,6 +52,56 @@ MAPS = """55d0c0a00000-55d0c0c00000 rw-p 00000000 00:00 0                       
 7f2c20000000-7f2c20100000 r-xp 00000000 08:01 1234                       /usr/lib/libfoo.so
 """
 
+SMAPS = """55d0c0a00000-55d0c0c00000 rw-p 00000000 00:00 0                          [heap]
+Size:               2048 kB
+Rss:                1500 kB
+Anonymous:          1500 kB
+AnonHugePages:         0 kB
+THPeligible:    0
+VmFlags: rd wr mr mw me ac
+7f2c00000000-7f2c02a21000 rw-p 00000000 00:00 0
+Rss:               40000 kB
+Anonymous:         40000 kB
+AnonHugePages:      2048 kB
+VmFlags: rd wr mr mw me nr sd
+7f2c02a21000-7f2c04000000 ---p 00000000 00:00 0
+Rss:                   0 kB
+Anonymous:             0 kB
+VmFlags: mr mw me nr sd
+7f2c08000000-7f2c0c000000 rw-p 00000000 00:00 0
+Rss:               60000 kB
+Anonymous:         60000 kB
+AnonHugePages:      4096 kB
+VmFlags: rd wr mr mw me nr sd
+7f2c14001000-7f2c15001000 rw-p 00000000 00:00 0
+Rss:               16000 kB
+Anonymous:         16000 kB
+VmFlags: rd wr mr mw me ac sd
+7f2c20000000-7f2c30000000 rw-p 00000000 00:00 0
+Rss:              200000 kB
+Anonymous:        200000 kB
+AnonHugePages:      8192 kB
+VmFlags: rd wr mr mw me ac sd
+7f2c40000000-7f2c40100000 rw-p 00000000 00:00 0                          [anon:cpython:pymalloc]
+Rss:                1024 kB
+Anonymous:          1024 kB
+7f2c41000000-7f2c41080000 rw-p 00000000 00:00 0
+Rss:                 300 kB
+Anonymous:           300 kB
+7f2c48000000-7f2c4e000000 rw-p 00000000 00:00 0
+Rss:               90000 kB
+Anonymous:         90000 kB
+VmFlags: rd wr mr mw me nr sd
+7f2c50000000-7f2c50100000 r-xp 00000000 08:01 1234                       /usr/lib/lib foo.so
+Rss:                 500 kB
+Anonymous:             0 kB
+7ffd1e5de000-7ffd1e5ff000 rw-p 00000000 00:00 0                          [stack]
+Rss:                 100 kB
+Anonymous:           100 kB
+ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0                  [vsyscall]
+Rss:                   0 kB
+"""
+
 RUNNER_CMDLINE = b"/opt/venv/bin/python\0-m\0src.plugin_runtime.runner.runner_main\0"
 
 
@@ -120,6 +170,95 @@ def test_glibc_heap_estimate_counts_only_aligned_64mib_heaps():
     # 7f2c14001000 起的一对合计正好 64 MiB，但起点没有按 64 MiB 对齐，不是线程堆。
     result = procfs.glibc_heap_estimate(MAPS)
     assert result == {"heaps": 2, "committed_kb": 43140 + 1024, "reserved_kb": 22396 + 64512, "main_heap_kb": 2048}
+
+
+def test_parse_smaps_reads_each_mapping_and_paths_with_spaces():
+    maps = procfs.parse_smaps(SMAPS)
+    assert len(maps) == 12
+    assert maps[0] == {"start": 0x55D0C0A00000, "end": 0x55D0C0C00000, "perms": "rw-p", "path": "[heap]",
+                       "kb": {"Size": 2048, "Rss": 1500, "Anonymous": 1500, "AnonHugePages": 0},
+                       "flags": ["rd", "wr", "mr", "mw", "me", "ac"]}
+    assert maps[9]["path"] == "/usr/lib/lib foo.so"
+    # 3.8 之前的内核没有 VmFlags。
+    assert maps[9]["flags"] is None
+
+
+def test_smaps_headers_give_the_same_heap_estimate_as_maps():
+    result = procfs.glibc_heap_estimate(procfs.maps_text_of(SMAPS))
+    # 用满 64 MiB、没有保留尾的线程堆，这个估计数不到。
+    assert result == {"heaps": 1, "committed_kb": 43140, "reserved_kb": 22396, "main_heap_kb": 2048}
+
+
+def test_anon_breakdown_separates_heaps_from_standalone_mappings():
+    result = procfs.anon_breakdown(procfs.parse_smaps(SMAPS))
+    assert result["brk_heap"] == {"maps": 1, "rss_kb": 1500, "anon_kb": 1500, "thp_kb": 0}
+    # 带 nr 的是线程堆，包括两个线程堆合并成的 96 MiB 一段；起点对齐、超过 64 MiB 但不带 nr 的不是。
+    assert result["glibc_arenas"] == {"maps": 3, "rss_kb": 190000, "anon_kb": 190000, "thp_kb": 6144}
+    assert result["other"] == {
+        "lt_2m": {"maps": 1, "rss_kb": 300, "anon_kb": 300, "thp_kb": 0},
+        "2m_to_64m": {"maps": 1, "rss_kb": 16000, "anon_kb": 16000, "thp_kb": 0},
+        "ge_64m": {"maps": 1, "rss_kb": 200000, "anon_kb": 200000, "thp_kb": 8192},
+    }
+    # 文件映射、保留尾与内核的特殊映射都不计。
+    assert list(result["named"]) == ["[anon:cpython:pymalloc]", "[stack]"]
+    assert result["named"]["[stack]"] == {"maps": 1, "rss_kb": 100, "anon_kb": 100, "thp_kb": 0}
+    assert [(item["kind"], item["size_kb"], item["rss_kb"]) for item in result["largest"]] == [
+        ("ge_64m", 262144, 200000), ("glibc_arena", 98304, 90000), ("glibc_arena", 65536, 60000),
+        ("glibc_arena", 43140, 40000), ("2m_to_64m", 16384, 16000),
+    ]
+
+
+@pytest.mark.parametrize("flags", [None, "rd wr mr mw me ac sd"])
+def test_anon_breakdown_falls_back_to_alignment_without_the_noreserve_flag(flags):
+    # 3.8 之前的内核没有 VmFlags；overcommit_memory=2 时线程堆不带 nr。
+    text = "7f2c04000000-7f2c06000000 rw-p 00000000 00:00 0\nRss: 500 kB\nAnonymous: 500 kB\n"
+    if flags is not None:
+        text += f"VmFlags: {flags}\n"
+    result = procfs.anon_breakdown(procfs.parse_smaps(text))
+    assert result["glibc_arenas"] == {"maps": 1, "rss_kb": 500, "anon_kb": 500, "thp_kb": 0}
+
+
+def test_anon_breakdown_counts_per_thread_stacks_of_old_kernels_as_one_entry():
+    # 4.5 之前的内核把每个线程栈记作 [stack:线程号]。
+    text = ("7f0000000000-7f0000800000 rw-p 00000000 00:00 0  [stack:1234]\nRss: 40 kB\nAnonymous: 40 kB\n"
+            "7f0000900000-7f0001100000 rw-p 00000000 00:00 0  [stack:1235]\nRss: 60 kB\nAnonymous: 60 kB\n")
+    named = procfs.anon_breakdown(procfs.parse_smaps(text))["named"]
+    assert named == {"[stack]": {"maps": 2, "rss_kb": 100, "anon_kb": 100, "thp_kb": 0}}
+
+
+def test_anon_breakdown_folds_extra_named_mappings_into_rest():
+    blocks = []
+    for index in range(procfs.NAMED_ANON_LIMIT + 2):
+        start = 0x7F0000000000 + index * 0x200000
+        blocks.append(f"{start:x}-{start + 0x100000:x} rw-p 00000000 00:00 0  [anon:pool{index}]\n"
+                      f"Rss: {index + 1} kB\nAnonymous: {index + 1} kB\n")
+    named = procfs.anon_breakdown(procfs.parse_smaps("".join(blocks)))["named"]
+    assert len(named) == procfs.NAMED_ANON_LIMIT + 1
+    # 按常驻量从大到小留前几名，最小的两个并进 _rest。
+    assert "[anon:pool11]" in named and "[anon:pool0]" not in named
+    assert named["_rest"] == {"maps": 2, "rss_kb": 3, "anon_kb": 3, "thp_kb": 0}
+
+
+@pytest.mark.parametrize(("text", "mode"), [
+    ("always [madvise] never\n", "madvise"),
+    ("[always] defer defer+madvise madvise never\n", "always"),
+])
+def test_parse_thp_mode_reads_the_bracketed_choice(text, mode):
+    assert procfs.parse_thp_mode(text) == mode
+
+
+def test_parse_thp_mode_rejects_unknown_text():
+    with pytest.raises(ValueError):
+        procfs.parse_thp_mode("always madvise never\n")
+
+
+def test_thp_settings_reads_enabled_and_defrag(tmp_path, monkeypatch):
+    monkeypatch.setattr(procfs, "THP_SYSFS", tmp_path / "missing")
+    assert procfs.thp_settings() is None
+    monkeypatch.setattr(procfs, "THP_SYSFS", tmp_path)
+    (tmp_path / "enabled").write_text("[always] madvise never\n", encoding="utf-8")
+    (tmp_path / "defrag").write_text("always defer defer+madvise [madvise] never\n", encoding="utf-8")
+    assert procfs.thp_settings() == {"enabled": "always", "defrag": "madvise"}
 
 
 def test_parse_cgroup_file_v2_and_v1():

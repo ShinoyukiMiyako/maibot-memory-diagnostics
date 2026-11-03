@@ -7,7 +7,8 @@ import pytest
 
 from memdiag import collector, procfs
 from memdiag.collector import (
-    Collector, Targets, Window, WorkerGone, dir_stats, file_stats, identity_of, sidecar_files, summarize_connections,
+    Collector, Targets, Window, WorkerGone, dir_stats, file_list, file_stats, identity_of, sidecar_files,
+    summarize_connections,
 )
 
 
@@ -82,6 +83,26 @@ def test_dir_stats_counts_matching_files_only(tmp_path):
     (tmp_path / "other.txt").write_bytes(b"x" * 99)
     assert dir_stats(tmp_path, "app_*.log.jsonl") == {"files": 2, "bytes": 15}
     assert dir_stats(tmp_path / "missing", "*") is None
+
+
+def test_dir_stats_finds_faiss_indexes_in_nested_vector_spaces(tmp_path):
+    (tmp_path / "vectors" / "paragraph").mkdir(parents=True)
+    (tmp_path / "images" / "vectors" / "abc").mkdir(parents=True)
+    (tmp_path / "vectors" / "vectors.index").write_bytes(b"x" * 7)
+    (tmp_path / "vectors" / "paragraph" / "vectors.index").write_bytes(b"x" * 11)
+    (tmp_path / "images" / "vectors" / "abc" / "vectors.index").write_bytes(b"x" * 13)
+    (tmp_path / "vectors" / "vectors.bin").write_bytes(b"x" * 99)
+    assert dir_stats(tmp_path, "**/*.index") == {"files": 3, "bytes": 31}
+
+
+def test_file_list_gives_relative_paths_sizes_and_mtimes(tmp_path):
+    (tmp_path / "vectors" / "spaces" / "s1").mkdir(parents=True)
+    index = tmp_path / "vectors" / "spaces" / "s1" / "vectors.index"
+    index.write_bytes(b"x" * 5)
+    os.utime(index, (1_000_000.5, 1_000_000.5))
+    (tmp_path / "vectors" / "vectors.bin").write_bytes(b"x")
+    assert file_list(tmp_path, "**/*.index") == [{"path": "vectors/spaces/s1/vectors.index", "size": 5, "mtime": 1_000_000.5}]
+    assert file_list(tmp_path / "missing", "**/*.index") is None
 
 
 SUPPORTED = pytest.mark.skipif(not (sys.platform in ("win32", "darwin") or sys.platform.startswith("linux")),
@@ -199,6 +220,25 @@ def test_trend_without_smaps_rollup_on_old_kernels(linux_trend):
     assert sampler.trend()["smaps"] == {"Rss": 12}
 
 
+def test_trend_reads_smaps_once_for_both_heap_estimate_and_anon_breakdown(linux_trend):
+    # 有 smaps 时线程堆估计也从它的首行得出，maps 不再读。
+    sampler, proc_dir, _ = linux_trend
+    (proc_dir / "maps").unlink()
+    (proc_dir / "smaps").write_text(
+        "55d0c0a00000-55d0c0e00000 rw-p 00000000 00:00 0  [heap]\nRss:  3000 kB\nAnonymous:  3000 kB\n", encoding="utf-8"
+    )
+    record = sampler.trend()
+    assert record["heap"]["main_heap_kb"] == 4096
+    assert record["anon_maps"]["brk_heap"] == {"maps": 1, "rss_kb": 3000, "anon_kb": 3000, "thp_kb": 0}
+
+
+def test_trend_without_smaps_estimates_heaps_from_maps(linux_trend):
+    sampler, _, _ = linux_trend
+    record = sampler.trend()
+    assert record["anon_maps"] is None
+    assert record["heap"]["main_heap_kb"] == 2048
+
+
 def test_failed_trend_keeps_the_window_for_the_next_record(linux_trend):
     sampler, _, monkeypatch = linux_trend
     sampler.commit_fast(fast_sample(100, 150, 200))
@@ -292,10 +332,11 @@ def test_fast_and_trend_on_current_process_produce_consistent_records(tmp_path, 
     assert trend["dirs"] == {"logs": {"files": 0, "bytes": 0}}
     meta = sampler.meta({"x": 1})
     assert meta["sqlite"] == sqlite3.sqlite_version and meta["x"] == 1
-    linux_keys = {"smaps", "heap", "fds", "cgroup"}
+    linux_keys = {"smaps", "heap", "anon_maps", "fds", "cgroup"}
     if collector.IS_LINUX:
         assert linux_keys <= set(trend)
         assert trend["smaps"]["Rss"] > 0 and trend["fds"]["total"] > 0
+        assert trend["anon_maps"]["brk_heap"]["rss_kb"] > 0
         assert trend["cgroup"]["version"] in (1, 2, None)
     else:
         assert not linux_keys & set(trend)
@@ -311,6 +352,7 @@ def test_meta_records_only_whitelisted_worker_environment(tmp_path, monkeypatch)
     monkeypatch.setattr(procfs, "cgroup_memory", lambda pid: {"version": None})
     record = Collector(make_targets(tmp_path, worker_pid=100, worker_identity=(100, 5))).meta({"x": 1})
     assert record["worker_env"] == {"MALLOC_ARENA_MAX": "2"}
+    assert record["thp"] == procfs.thp_settings()
     assert "secret" not in json.dumps(record)
     assert "instance_root" not in record
     assert record["kernel"] and record["x"] == 1

@@ -353,6 +353,8 @@ def test_resolve_targets_reads_webui_port_only_when_enabled(instance):
     assert without_webui.webui_port is None
     assert on_new_host.webui_port == 18002
     assert with_webui.db_files["main_db"] == root / "data" / "MaiBot.db"
+    # 各向量空间与图片向量的 faiss 索引都在 A_Memorix 数据目录的子目录里。
+    assert with_webui.watched_dirs["amemorix_faiss_index"] == ((root / "data" / "a-memorix").resolve(), "**/*.index")
 
 
 @pytest.mark.parametrize(("config", "expected"), [
@@ -844,8 +846,11 @@ def test_unload_interrupts_a_running_pack(instance):
 
 @needs_platform
 def test_end_to_end_collect_summarize_pack_and_unload(instance):
-    _, data_dir = instance
+    root, data_dir = instance
     plugin, send = make_plugin(data_dir, command={"allowed_users": ["qq:1"]})
+    index = root / "data" / "a-memorix" / "vectors" / "spaces" / "s1" / "paragraph" / "vectors.index"
+    index.parent.mkdir(parents=True)
+    index.write_bytes(b"x" * 9)
 
     async def scenario():
         await plugin.on_load()
@@ -886,6 +891,10 @@ def test_end_to_end_collect_summarize_pack_and_unload(instance):
     assert meta["wid"] == list(plugin_collector.identity_of(os.getpid()))
     assert "Worker pid=" in meta["summary"] and "样本目录" not in meta["summary"]
     assert meta["config"]["command"] == {"allowed_users_count": 1}
+    assert [(item["path"], item["size"]) for item in meta["amemorix_faiss_indexes"]] == [
+        ("vectors/spaces/s1/paragraph/vectors.index", 9),
+    ]
+    assert trend_lines[1]["dirs"]["amemorix_faiss_index"] == {"files": 1, "bytes": 9}
 
 
 # ---- RPC 探测 --------------------------------------------------------------------
