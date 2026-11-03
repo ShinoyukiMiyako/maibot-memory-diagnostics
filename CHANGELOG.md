@@ -6,7 +6,8 @@
   带名字的映射），并列出最大的 5 块，用来分辨涨的是 malloc 的堆还是堆外的大块映射。线程堆估计改从同一份 `smaps`
   得出，不再另读 `maps`；没有 `smaps` 的内核照旧读 `maps`，`anon_maps` 记为 `null`。
 - `meta` 新增透明大页设置 `thp`（Linux）。
-- 新增观测 A_Memorix 数据目录下全部 faiss 索引文件的个数与总大小（`dirs.amemorix_faiss_index`）。
+- 新增观测 A_Memorix 数据目录下全部 faiss 索引文件的个数与总大小（`dirs.amemorix_faiss_index`）；
+  诊断包的 `meta.json` 另列逐个索引文件的相对路径、大小与修改时间（`amemorix_faiss_indexes`）。
 - 修复：Windows 上每在 Runner 内重载一次插件，旧模块的结构体类就被 ctypes 的全局缓存留住一份（Python 3.13 及以前）。
 - 修复：超过 1 小时的打包残片删不掉时，之后每次打包都会失败；现在新包照常生成，回复里注明删不掉的个数。
 
