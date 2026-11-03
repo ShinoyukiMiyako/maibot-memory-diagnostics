@@ -689,8 +689,10 @@ class MemDiagPlugin(MaiBotPlugin):
         )
         if stale:
             for old, exc in stale:
-                self.ctx.logger.warning("旧诊断包 %s 删不掉，下次打包再删: %r", old.name, exc)
-            text += f"另有 {len(stale)} 个旧包删不掉（可能正被别的程序打开），下次打包时再删。"
+                self.ctx.logger.warning("旧诊断包或打包残片 %s 删不掉，下次打包再删: %r", old.name, exc)
+            partials = sum(1 for old, _ in stale if old.name.endswith(".partial"))
+            counts = ((len(stale) - partials, "旧包"), (partials, "打包残片"))
+            text += f"另有 {'、'.join(f'{count} 个{what}' for count, what in counts if count)}删不掉（可能正被别的程序打开），下次打包时再删。"
         await self._reply(stream_id, text)
 
     @staticmethod

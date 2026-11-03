@@ -225,6 +225,26 @@ def test_build_pack_still_succeeds_when_a_stale_partial_cannot_be_deleted(tmp_pa
     assert sorted(p.name for p in out.iterdir()) == sorted([leftover.name, path.name])
 
 
+def test_build_pack_skips_a_stale_partial_that_vanishes_while_being_cleaned(tmp_path, go, monkeypatch):
+    # 重载前的旧实例同时在打包，列目录之后残片被它改名或删掉了：目的已经达到，不能报成删不掉。
+    out = tmp_path / "packs"
+    out.mkdir()
+    leftover = out / "memdiag-20200101-000000Z.zip.partial"
+    leftover.write_bytes(b"x")
+    os.utime(leftover, (time.time() - 2 * report.PARTIAL_MAX_AGE_SEC,) * 2)
+    real_unlink = Path.unlink
+
+    def unlink(self, *args, **kwargs):
+        real_unlink(self, *args, **kwargs)
+        if self == leftover:
+            raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    path, stale = build_pack(out, {}, {"k": 1}, keep=1, cancel=go)
+    assert stale == []
+    assert sorted(p.name for p in out.iterdir()) == [path.name]
+
+
 def test_build_pack_removes_partial_on_failure_and_cleans_stale_leftovers(tmp_path, go):
     out = tmp_path / "packs"
     out.mkdir()

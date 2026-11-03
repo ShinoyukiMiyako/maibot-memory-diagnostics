@@ -1399,16 +1399,21 @@ def test_history_is_restored_across_rotation_and_restarts(instance):
 
 
 @needs_platform
-def test_pack_reply_mentions_old_packs_that_could_not_be_deleted(instance):
+@pytest.mark.parametrize(("names", "expected"), [
+    (["memdiag-20200101-000000Z.zip"], "另有 1 个旧包删不掉"),
+    (["memdiag-20200101-000000Z.zip.partial"], "另有 1 个打包残片删不掉"),
+    (["memdiag-20200101-000000Z.zip", "memdiag-20200102-000000Z.zip.partial"], "另有 1 个旧包、1 个打包残片删不掉"),
+])
+def test_pack_reply_mentions_old_files_that_could_not_be_deleted(instance, names, expected):
     _, data_dir = instance
     plugin, send = make_plugin(data_dir)
     made = data_dir / "packs" / "memdiag-20261029-000000Z.zip"
-    old = data_dir / "packs" / "memdiag-20200101-000000Z.zip"
+    olds = [data_dir / "packs" / name for name in names]
 
     def build(*args):
         made.parent.mkdir(parents=True, exist_ok=True)
         made.write_bytes(b"zip")
-        return made, [(old, PermissionError(13, "being used by another process"))]
+        return made, [(old, PermissionError(13, "being used by another process")) for old in olds]
 
     plugin._build_pack_blocking = build
 
@@ -1421,5 +1426,5 @@ def test_pack_reply_mentions_old_packs_that_could_not_be_deleted(instance):
 
     asyncio.run(scenario())
     finished = send.sent[-1]["text"]
-    assert finished.startswith("诊断包已生成：") and "另有 1 个旧包删不掉" in finished
-    assert any(old.name in text for text in plugin.ctx.logger.levels("warning"))
+    assert finished.startswith("诊断包已生成：") and expected in finished
+    assert all(any(old.name in text for text in plugin.ctx.logger.levels("warning")) for old in olds)
