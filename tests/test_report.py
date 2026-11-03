@@ -205,6 +205,26 @@ def test_build_pack_keeps_the_new_pack_when_an_old_one_cannot_be_deleted(tmp_pat
         assert json.loads(archive.read("meta.json")) == {"k": 1}
 
 
+def test_build_pack_still_succeeds_when_a_stale_partial_cannot_be_deleted(tmp_path, go, monkeypatch):
+    # 强杀留下的残片在 Windows 上被别的程序占着时删不掉；不能因此让之后的每次打包都失败。
+    out = tmp_path / "packs"
+    out.mkdir()
+    leftover = out / "memdiag-20200101-000000Z.zip.partial"
+    leftover.write_bytes(b"x")
+    os.utime(leftover, (time.time() - 2 * report.PARTIAL_MAX_AGE_SEC,) * 2)
+    real_unlink = Path.unlink
+
+    def unlink(self, *args, **kwargs):
+        if self == leftover:
+            raise PermissionError(13, "being used by another process")
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    path, stale = build_pack(out, {}, {"k": 1}, keep=1, cancel=go)
+    assert [(item, type(exc)) for item, exc in stale] == [(leftover, PermissionError)]
+    assert sorted(p.name for p in out.iterdir()) == sorted([leftover.name, path.name])
+
+
 def test_build_pack_removes_partial_on_failure_and_cleans_stale_leftovers(tmp_path, go):
     out = tmp_path / "packs"
     out.mkdir()

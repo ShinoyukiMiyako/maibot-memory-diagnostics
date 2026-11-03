@@ -180,16 +180,23 @@ def build_pack(
 
     先写 .partial 再在同目录内改名：Docker 下插件数据目录是单独挂载的，跨设备改名会失败。
     失败或被停止时删掉 .partial 再抛出，避免残片绕过 keep 的清理一直占着磁盘；进程被强杀时删不了，
-    留到之后某次打包按时长清理。返回 (新包, 删不掉的旧包及原因)：新包已经写好，旧包删不掉
+    留到之后某次打包按时长清理。返回 (新包, 删不掉的旧包与残片及原因)：旧文件删不掉
     （Windows 上正被解压软件打开）不能让这次打包算作失败，由调用方告诉用户。
     """
     if keep < 1:
         raise ValueError(f"keep 至少为 1: {keep}")
     out_dir.mkdir(parents=True, exist_ok=True)
     now = time.time()
+    failed: List[Tuple[Path, OSError]] = []
     for leftover in out_dir.glob(f"{PACK_PREFIX}*.zip.partial"):
-        if now - leftover.stat().st_mtime > PARTIAL_MAX_AGE_SEC:
-            leftover.unlink()
+        try:
+            if now - leftover.stat().st_mtime > PARTIAL_MAX_AGE_SEC:
+                leftover.unlink()
+        except FileNotFoundError:
+            # 列目录之后被同时进行的另一次打包（重载前的旧实例）改名或删掉了。
+            continue
+        except OSError as exc:
+            failed.append((leftover, exc))
     path = _pack_name(out_dir)
     partial = path.with_name(path.name + ".partial")
     try:
@@ -207,7 +214,6 @@ def build_pack(
     others: List[Path] = sorted(
         (old for old in out_dir.glob(f"{PACK_PREFIX}*.zip") if old != path), key=lambda old: old.stat().st_mtime
     )
-    failed: List[Tuple[Path, OSError]] = []
     for old in others[: max(0, len(others) - (keep - 1))]:
         try:
             old.unlink()
