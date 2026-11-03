@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "shinoyuki.memdiag",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "name": "内存诊断",
   "description": "从进程外周期采集 Worker 内存、cgroup、WebUI 连接队列、主库只读统计与关键文件大小，写入插件数据目录；/memdiag 回复摘要，/memdiag pack 生成诊断包",
   "author": {

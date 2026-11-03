@@ -27,7 +27,7 @@ from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
 from . import dbstats, report, storage
 from .collector import PRIMARY_LABEL, Collector, Targets, WorkerGone, ensure_supported_platform, file_list, find_worker
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 FAST_STEM = "fast"
 TREND_STEM = "trend"
 COMMAND_PATTERN = r"^\s*/memdiag(?:\s+(?P<sub>pack))?\s*$"
