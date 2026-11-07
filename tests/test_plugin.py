@@ -141,6 +141,8 @@ def instance(tmp_path, monkeypatch):
     """让测试进程扮演 Worker：插件 Runner 本应是它的子进程。"""
     root, data_dir = make_instance(tmp_path)
     monkeypatch.chdir(root)
+    # 默认按 1.3.x 及更早的宿主读配置；在 1.4.0 的 Runner 里跑测试时环境里会有这个变量。
+    monkeypatch.delenv("MAIBOT_RUNTIME_CONTEXT", raising=False)
     pid = os.getpid()
     monkeypatch.setattr(plugin_module, "find_worker", lambda: (pid, plugin_collector.identity_of(pid)))
     monkeypatch.setattr(plugin_collector.os, "getppid", lambda: pid)
@@ -335,6 +337,58 @@ def test_config_value_rejects_missing_and_mistyped_host_values(tmp_path, key, va
         asyncio.run(plugin._config_value(key, expected))
 
 
+def test_host_config_path_follows_the_runtime_contract(tmp_path, monkeypatch):
+    monkeypatch.delenv("MAIBOT_RUNTIME_CONTEXT", raising=False)
+    monkeypatch.delenv("MAIBOT_SHARED_MODEL_CATALOG", raising=False)
+    assert plugin_module.host_config_path() is None
+    monkeypatch.setenv("MAIBOT_RUNTIME_CONTEXT", "{}")
+    with pytest.raises(RuntimeError):
+        plugin_module.host_config_path()
+    # 新建的 Bot 实例在 bots/<id>/ 下，宿主配置在工作区的 host/ 里，跟着共享模型目录走。
+    monkeypatch.setenv("MAIBOT_SHARED_MODEL_CATALOG", str(tmp_path / "workspace" / "host" / "model_catalog.toml"))
+    assert plugin_module.host_config_path() == tmp_path / "workspace" / "host" / "config.toml"
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("[webui]\nenabled = false\nport = 18003\n", (False, 18003)),
+    # 宿主对缺省项按 enabled = true、port = 8001 启动。
+    ("[webui]\nhosts = ['127.0.0.1']\n", (True, 8001)),
+    ("", (True, 8001)),
+])
+def test_host_webui_settings_reads_the_host_config(tmp_path, text, expected):
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+    assert plugin_module.host_webui_settings(path) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "webui = 1\n", "[webui]\nport = '8001'\n", "[webui]\nport = true\n", "[webui]\nenabled = 'yes'\n",
+])
+def test_host_webui_settings_refuses_mistyped_values(tmp_path, text):
+    path = tmp_path / "config.toml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        plugin_module.host_webui_settings(path)
+
+
+@needs_platform
+@pytest.mark.parametrize(("enabled", "expected"), [("true", 18004), ("false", None)])
+def test_resolve_targets_reads_webui_from_the_host_config_on_new_hosts(instance, monkeypatch, enabled, expected):
+    # 1.4.0 的 config.get 没有 webui.enabled 与 http.port，0.1.1 在这里加载失败。
+    root, data_dir = instance
+    host_dir = root.parent / "workspace" / "host"
+    host_dir.mkdir(parents=True)
+    (host_dir / "config.toml").write_text(f"[webui]\nenabled = {enabled}\nport = 18004\n", encoding="utf-8")
+    monkeypatch.setenv("MAIBOT_RUNTIME_CONTEXT", "{}")
+    monkeypatch.setenv("MAIBOT_SHARED_MODEL_CATALOG", str(host_dir / "model_catalog.toml"))
+    plugin, _ = make_plugin(data_dir, config_values={"a_memorix.storage.data_dir": "data/a-memorix"})
+    targets = asyncio.run(plugin._resolve_targets())
+    assert targets.webui_port == expected
+    assert targets.webui_owner == "host"
+    assert targets.db_files["main_db"] == root / "data" / "MaiBot.db"
+    assert set(plugin.ctx.config.timeouts) == {"a_memorix.storage.data_dir"}
+
+
 @needs_platform
 def test_resolve_targets_reads_webui_port_only_when_enabled(instance):
     root, data_dir = instance
@@ -352,6 +406,7 @@ def test_resolve_targets_reads_webui_port_only_when_enabled(instance):
     assert with_webui.webui_port == 18001
     assert without_webui.webui_port is None
     assert on_new_host.webui_port == 18002
+    assert {with_webui.webui_owner, without_webui.webui_owner, on_new_host.webui_owner} == {"worker"}
     assert with_webui.db_files["main_db"] == root / "data" / "MaiBot.db"
     # 各向量空间与图片向量的 faiss 索引都在 A_Memorix 数据目录的子目录里。
     assert with_webui.watched_dirs["amemorix_faiss_index"] == ((root / "data" / "a-memorix").resolve(), "**/*.index")
@@ -937,8 +992,14 @@ def test_rpc_probe_asks_for_more_than_the_default_rpc_timeout(tmp_path):
     # 宿主默认 30 秒超时：超过它的卡顿会被切成几段，rpc_ms 记不下真实时长。
     plugin, _ = make_plugin(tmp_path)
     asyncio.run(plugin._probe_rpc_ms())
-    assert plugin.ctx.config.timeouts["webui.enabled"] == [plugin_module.PROBE_TIMEOUT_MS]
+    assert plugin.ctx.config.timeouts["a_memorix.storage.data_dir"] == [plugin_module.PROBE_TIMEOUT_MS]
     assert plugin_module.PROBE_TIMEOUT_MS > 30_000
+
+
+def test_rpc_probe_works_without_the_webui_keys_that_new_hosts_dropped(tmp_path):
+    # 1.4.0 的 config.get 对 webui.enabled 返回 None；拿它探测的话每一轮都记成失败。
+    plugin, _ = make_plugin(tmp_path, config_values={"a_memorix.storage.data_dir": "data/a-memorix"})
+    assert asyncio.run(plugin._probe_rpc_ms()) >= 0
 
 
 @needs_platform

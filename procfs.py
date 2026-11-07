@@ -493,10 +493,10 @@ def socket_inodes(pid: int) -> Set[int]:
 
 
 def webui_connections(pid: int, port: int) -> Dict[str, Any]:
-    """WebUI 端口上属于 Worker 的监听与已建立连接。
+    """WebUI 端口上属于 pid（Worker，1.4.0 起是宿主进程）的监听与已建立连接。
 
-    net/tcp 是整个网络命名空间的表，同端口的条目不一定属于 Worker（例如同机另一个实例），
-    所以用 Worker 持有的 socket inode 认归属。WebUI 启动时端口冲突只记日志，enabled 为真也可能没在监听。
+    net/tcp 是整个网络命名空间的表，同端口的条目不一定属于这个进程（例如同机另一个实例），
+    所以用它持有的 socket inode 认归属。WebUI 启动时端口冲突只记日志，enabled 为真也可能没在监听。
     """
     entries: List[Dict[str, Any]] = []
     for name in ("tcp", "tcp6"):

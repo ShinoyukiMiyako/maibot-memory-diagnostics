@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import threading
 import time
+import tomllib
 import traceback
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
@@ -38,6 +39,13 @@ HISTORY_HOURS = 26
 PROBE_WAIT_SEC = 5.0
 # 宿主默认 30 秒超时。探测要量的就是长卡顿，超时后重新发请求会把一次卡顿切成几段，趋势里只留下最后一段。
 PROBE_TIMEOUT_MS = 600_000
+# 探测只要一次往返，选所有支持的宿主版本都有、插件启动时本来就要读的键。
+PROBE_CONFIG_KEY = "a_memorix.storage.data_dir"
+# 1.4.0 起 Worker 由宿主进程拉起并带上运行契约，Runner 继承 Worker 的环境；更早的版本没有这两个变量。
+RUNTIME_CONTEXT_ENV = "MAIBOT_RUNTIME_CONTEXT"
+SHARED_MODELS_ENV = "MAIBOT_SHARED_MODEL_CATALOG"
+# 与宿主 src/host/config.py 一致：host/config.toml 的 [webui] 可以不写 enabled 与 port。
+HOST_WEBUI_DEFAULT_PORT = 8001
 
 
 class PluginSection(PluginConfigBase):
@@ -126,7 +134,37 @@ def amemorix_metadata_db(root: Path, raw_data_dir: str) -> Path:
     return base.resolve() / "metadata" / "metadata.db"
 
 
+def host_config_path() -> Optional[Path]:
+    """宿主配置 host/config.toml 的位置；没有宿主运行契约（1.3.x 及更早）时为 None。
+
+    1.4.0 起对外 HTTP（WebUI、Bot 代理、文件传输）由宿主进程提供，开关与端口在工作区的 host/config.toml，
+    config.get 只读得到 Bot 自己的配置。宿主不把工作区路径传给 Worker，但共享模型目录就放在同一个 host/ 下；
+    不能从实例根推：新建的 Bot 实例在 bots/<id>/，只有从旧版升级来的 Bot 实例根才是工作区。
+    """
+    if RUNTIME_CONTEXT_ENV not in os.environ:
+        return None
+    catalog = os.environ.get(SHARED_MODELS_ENV, "").strip()
+    if not catalog:
+        raise RuntimeError(f"有宿主运行契约 {RUNTIME_CONTEXT_ENV} 却没有 {SHARED_MODELS_ENV}，找不到宿主目录")
+    return Path(catalog).parent / "config.toml"
+
+
+def host_webui_settings(path: Path) -> Tuple[bool, int]:
+    """读 host/config.toml 里的 webui.enabled 与 webui.port。"""
+    with path.open("rb") as stream:
+        webui = tomllib.load(stream).get("webui", {})
+    if not isinstance(webui, dict):
+        raise RuntimeError(f"{path} 里的 webui 不是配置节: {webui!r}")
+    # 缺省值照宿主自己的解析，不是兜底：宿主按同样的缺省值启动 HTTP 服务。
+    enabled = webui.get("enabled", True)
+    port = webui.get("port", HOST_WEBUI_DEFAULT_PORT)
+    if not isinstance(enabled, bool) or type(port) is not int:
+        raise RuntimeError(f"{path} 里的 webui.enabled 或 webui.port 不可用: {enabled!r}, {port!r}")
+    return enabled, port
+
+
 def statistics_report_path(root: Path) -> Path:
+    # 1.4.0 起宿主不再生成这份报告，文件不存在时记为 null。
     raw = os.environ.get("MAIBOT_STATISTICS_REPORT_PATH", "").strip() or "maibot_statistics.html"
     path = Path(raw)
     return path if path.is_absolute() else root / path
@@ -391,8 +429,13 @@ class MemDiagPlugin(MaiBotPlugin):
         if not os.path.samefile(root, os.getcwd()):
             # Runner 继承 Worker 的工作目录，两版都等于实例根；不一致多半是符号链接，记一笔继续按插件数据目录推。
             self.ctx.logger.warning("实例根 %s 与工作目录 %s 不一致，以插件数据目录推出的实例根为准", root, os.getcwd())
-        webui_enabled = await self._config_value("webui.enabled", bool)
-        webui_port = await self._webui_port() if webui_enabled else None
+        host_config = host_config_path()
+        if host_config is None:
+            webui_enabled = await self._config_value("webui.enabled", bool)
+            webui_port = await self._webui_port() if webui_enabled else None
+        else:
+            webui_enabled, port = await asyncio.to_thread(host_webui_settings, host_config)
+            webui_port = port if webui_enabled else None
         amemorix_dir = await self._config_value("a_memorix.storage.data_dir", str)
         worker_pid, identity = await asyncio.to_thread(find_worker)
         main_db = await asyncio.to_thread(locate_main_db, root)
@@ -403,6 +446,7 @@ class MemDiagPlugin(MaiBotPlugin):
             worker_identity=identity,
             instance_root=root,
             webui_port=webui_port,
+            webui_owner="worker" if host_config is None else "host",
             watched_files={
                 # 已发布的版本都是整份 JSON；JSONL 留给改成追加写的版本，迁移瞬间可能两个都在。
                 "review_log_json": logs / "expression_review" / "review_logs.json",
@@ -551,7 +595,7 @@ class MemDiagPlugin(MaiBotPlugin):
 
     async def _probe_rpc_ms(self) -> float:
         started = time.perf_counter()
-        await self._config_value("webui.enabled", bool, timeout_ms=PROBE_TIMEOUT_MS)
+        await self._config_value(PROBE_CONFIG_KEY, str, timeout_ms=PROBE_TIMEOUT_MS)
         return (time.perf_counter() - started) * 1000.0
 
     @staticmethod

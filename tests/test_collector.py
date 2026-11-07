@@ -115,7 +115,7 @@ DARWIN_ONLY = pytest.mark.skipif(sys.platform != "darwin", reason="只在 macOS 
 def make_targets(tmp_path, **overrides):
     pid = os.getpid()
     values = dict(worker_pid=pid, worker_identity=(pid, 0), instance_root=tmp_path, webui_port=None,
-                  watched_files={}, db_files={})
+                  webui_owner="worker", watched_files={}, db_files={})
     values.update(overrides)
     return Targets(**values)
 
@@ -193,6 +193,25 @@ def test_fast_linux_adds_webui_summary_when_port_known(linux_fast):
     conn = {"state": "01", "remote_port": 1, "tx_queue": 4_000_000, "rx_queue": 0, "timer": 4, "inode": 1}
     monkeypatch.setattr(procfs, "webui_connections", lambda pid, port: {"listening": True, "conns": [conn]})
     assert sampler.fast()["webui"]["stalled"] == 1
+
+
+@pytest.mark.parametrize(("owner", "expected"), [("worker", 100), ("host", 77)])
+def test_fast_linux_reads_webui_sockets_of_the_owning_process(linux_fast, owner, expected):
+    # 1.4.0 起端口在宿主进程（Worker 的父进程）手里，按 Worker 的 socket 认归属会一直是“未在监听”。
+    sampler, snapshots, monkeypatch = linux_fast
+    sampler.targets.webui_port = 8001
+    sampler.targets.webui_owner = owner
+    monkeypatch.setattr(procfs, "descendants", lambda pid: ({}, 0))
+    monkeypatch.setattr(procfs, "process_identity", lambda pid: {100: (77, 5)}[pid])
+    asked = []
+
+    def webui_connections(pid, port):
+        asked.append((pid, port))
+        return {"listening": True, "conns": []}
+
+    monkeypatch.setattr(procfs, "webui_connections", webui_connections)
+    assert sampler.fast()["webui"]["listening"] is True
+    assert asked == [(expected, 8001)]
 
 
 @pytest.fixture
@@ -332,6 +351,7 @@ def test_fast_and_trend_on_current_process_produce_consistent_records(tmp_path, 
     assert trend["dirs"] == {"logs": {"files": 0, "bytes": 0}}
     meta = sampler.meta({"x": 1})
     assert meta["sqlite"] == sqlite3.sqlite_version and meta["x"] == 1
+    assert meta["webui_owner"] == "worker"
     linux_keys = {"smaps", "heap", "anon_maps", "fds", "cgroup"}
     if collector.IS_LINUX:
         assert linux_keys <= set(trend)

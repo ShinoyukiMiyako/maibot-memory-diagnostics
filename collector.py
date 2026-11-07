@@ -47,6 +47,8 @@ class Targets:
     worker_identity: Tuple[Any, ...]
     instance_root: Path
     webui_port: Optional[int]
+    # 持有 WebUI 端口的进程："worker"，或 1.4.0 起的 "host"（宿主进程，即 Worker 的父进程）。
+    webui_owner: str
     watched_files: Dict[str, Path]
     db_files: Dict[str, Path]
     watched_dirs: Dict[str, Tuple[Path, str]] = field(default_factory=dict)
@@ -202,8 +204,14 @@ class Collector:
         if hidden:
             result["proc_hidden"] = hidden
         if self.targets.webui_port is not None:
-            result["webui"] = summarize_connections(procfs.webui_connections(pid, self.targets.webui_port))
+            result["webui"] = summarize_connections(procfs.webui_connections(self._webui_pid(), self.targets.webui_port))
         return result
+
+    def _webui_pid(self) -> int:
+        """1.4.0 起 Worker 只在进程间通道上提供接口，对外 HTTP 在宿主进程里；宿主直接拉起 Worker，中间没有启动器。"""
+        if self.targets.webui_owner == "host":
+            return procfs.process_identity(self.targets.worker_pid)[0]
+        return self.targets.worker_pid
 
     def _fast_windows(self) -> Dict[str, Any]:
         pid = self.targets.worker_pid
@@ -288,7 +296,7 @@ class Collector:
             record["fds"] = procfs.fd_summary(pid, self.targets.db_files)
             record["cgroup"] = procfs.cgroup_memory(pid)
             if self.targets.webui_port is not None:
-                record["webui_conns"] = procfs.webui_connections(pid, self.targets.webui_port)["conns"]
+                record["webui_conns"] = procfs.webui_connections(self._webui_pid(), self.targets.webui_port)["conns"]
         record["files"] = file_stats({**self.targets.watched_files, **self.targets.db_files, **sidecar_files(self.targets.db_files)})
         record["dirs"] = {name: dir_stats(path, pattern) for name, (path, pattern) in self.targets.watched_dirs.items()}
         return record
@@ -312,6 +320,7 @@ class Collector:
             "worker_pid": self.targets.worker_pid,
             "wid": list(self.targets.worker_identity),
             "webui_port": self.targets.webui_port,
+            "webui_owner": self.targets.webui_owner,
         }
         if IS_LINUX:
             record["kernel"] = os.uname().release
