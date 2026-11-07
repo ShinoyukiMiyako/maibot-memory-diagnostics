@@ -177,7 +177,7 @@ def test_manifest_is_valid_utf8_without_bom_and_matches_code():
     assert manifest["version"] == plugin_module.PLUGIN_VERSION
     assert re.fullmatch(r"\d+\.\d+\.\d+", manifest["version"])
     assert manifest["capabilities"] == ["send.text", "config.get"]
-    assert manifest["host_application"] == {"min_version": "1.2.3", "max_version": "1.3.99"}
+    assert manifest["host_application"] == {"min_version": "1.2.3", "max_version": "1.4.99"}
     assert manifest["sdk"] == {"min_version": "2.8.0", "max_version": "2.99.99"}
 
 

@@ -1,5 +1,15 @@
 # 更新日志
 
+## 0.1.2
+
+- 适配 MaiBot 1.4.0。1.4.0 起由宿主进程管理各个 Bot，对外的 WebUI 端口在宿主进程里，开关与端口挪到了宿主的
+  `host/config.toml`；0.1.1 读 `webui.enabled` 得到空值，在 1.4.0 上加载失败。现在有宿主运行契约时从
+  `host/config.toml` 读这两项，WebUI 连接按宿主进程（Worker 的父进程）的 socket 统计，`meta` 新增 `webui_owner`。
+- 每轮 RPC 探测改读 `a_memorix.storage.data_dir`：原来借用的 `webui.enabled` 在 1.4.0 上不存在，探测会每轮失败。
+- 清单声明兼容宿主 1.2.3 至 1.4.x。1.4.0 起宿主不再生成统计报告 HTML，`files.statistics_report` 记为 `null`。
+- 端到端验证：官方 Docker 镜像 1.4.0（全新部署时新建在 `bots/` 下的 Bot，SDK 2.21.0）、1.3.17、1.3.8、1.2.3。
+  1.4.0 上从 1.3.x 原地升级来的 Bot 没有单独跑过。
+
 ## 0.1.1
 
 - 趋势记录新增 `anon_maps`（Linux）：从 `smaps` 按映射种类汇总常驻的匿名内存（主堆、线程堆、按大小分档的其余映射、
