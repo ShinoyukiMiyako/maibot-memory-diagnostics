@@ -25,10 +25,12 @@ MaiBot 运行几天到几十天后内存一路上涨、被 OOM 杀掉或被容�
 
    | 部署方式 | 诊断包位置 |
    | --- | --- |
-   | Docker（官方 compose） | `docker-compose.yml` 所在目录下的 `data/MaiMBot-plugin-data/shinoyuki.memdiag/packs/` |
+   | Docker（官方 compose） | `docker-compose.yml` 所在目录下的 `data/MaiMBot-plugin-data/shinoyuki.memdiag/packs/`；1.4.0 起新建的 Bot 在 `data/MaiMBot-bots/<Bot ID>/data/plugins/shinoyuki.memdiag/packs/` |
    | 直接运行 | `<实例根>/data/plugins/shinoyuki.memdiag/packs/` |
 
    Docker 下回复里的路径 `data/plugins/...` 是容器内路径，到宿主机上按上表找。WebUI 下载不了诊断包。
+   1.4.0 起一个宿主可以管理多个 Bot：从 1.3.x 升级来的 Bot，实例根仍是原来的 MaiBot 目录；新建的 Bot
+   （包括 1.4.0 起全新部署时的第一个 Bot）在工作区的 `bots/<Bot ID>/` 下。
 6. [联系开发者](https://github.com/ShinoyukiMiyako)，把诊断包发过去，写明运行了多久、内存涨到多少。
 
    Docker 部署再附上重启次数，OOM 后容器恢复运行时 `OOMKilled` 会变回 `false`，这个数不会：
@@ -45,15 +47,19 @@ MaiBot 运行几天到几十天后内存一路上涨、被 OOM 杀掉或被容�
 
 | 项目 | 范围 |
 | --- | --- |
-| MaiBot 宿主 | 1.2.3 至 1.3.x |
+| MaiBot 宿主 | 1.2.3 至 1.4.x |
 | maibot-plugin-sdk | 2.8.0 及以上 |
 | Linux | 全部功能；4.5 之前的内核从 `statm` 推算匿名内存，4.14 之前的内核没有 `smaps_rollup`（记为 `null`），没开 `CONFIG_PROC_PAGE_MONITOR` 的内核没有 `anon_maps`（记为 `null`） |
 | Windows | 进程内存、子进程、文件大小、数据库统计照常；没有 smaps、匿名映射分类、glibc 堆估计、透明大页设置、cgroup、fd、线程数、正在退出的进程数与全部 WebUI 连接信息，另记句柄数 `handles` |
 | macOS | 进程内存（主指标是物理占用 `phys_footprint`，峰值也按它算）、线程数、子进程、文件大小、数据库统计照常；没有 smaps、匿名映射分类、glibc 堆估计、透明大页设置、cgroup、fd、正在退出的进程数与全部 WebUI 连接信息 |
 | 其他 | 不支持，插件加载时直接报错 |
 
-真实宿主上的端到端验证只在 Linux 上做过：官方 Docker 镜像 1.2.3、1.3.8、1.3.17、1.3.19（含容器 OOM 后恢复采集），
-以及直接运行的 1.2.3。其中 ZIP 安装与放行走的是 WebUI 的接口，没有点过页面。Windows 与 macOS 上跑过采集代码的全部测试
+1.4.0 起 MaiBot 由一个宿主进程管理各个 Bot，每个 Bot 是宿主拉起的一个 Worker 进程。插件观测的是自己所在 Bot 的 Worker；
+对外的 WebUI 端口在宿主进程里，WebUI 连接按宿主进程统计，开关与端口从宿主的 `host/config.toml` 读。
+
+真实宿主上的端到端验证只在 Linux 上做过：官方 Docker 镜像 1.2.3、1.3.8、1.3.17、1.3.19（含容器 OOM 后恢复采集）、
+1.4.0（全新部署时新建在 `bots/` 下的 Bot），以及直接运行的 1.2.3。1.4.0 上从 1.3.x 原地升级来的 Bot 没有单独跑过。
+其中 ZIP 安装与放行走的是 WebUI 的接口，没有点过页面。Windows 与 macOS 上跑过采集代码的全部测试
 （macOS 为 GitHub Actions 的 arm64 与 Intel 机器，读的是真实进程），没有在真实宿主里运行过。
 
 macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，这段时间没有样本；停住约 35 秒起，
@@ -66,7 +72,8 @@ macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，
 
 - WebUI（1.3.3 起）：在侧栏“插件扩展”页点右上角的“更多操作”（…），选“从 ZIP 安装插件”，上传这个 ZIP，不用解压，然后按提示重启麦麦。
 - 手动（所有版本）：解压后把目录放进插件目录，目录里要直接有 `_manifest.json` 与 `plugin.py`，然后重启麦麦。
-  插件目录直接运行时是 `<实例根>/plugins/`，Docker（官方 compose）是 `docker-compose.yml` 所在目录下的 `data/MaiMBot/plugins/`。
+  插件目录直接运行时是 `<实例根>/plugins/`，Docker（官方 compose）是 `docker-compose.yml` 所在目录下的 `data/MaiMBot/plugins/`，
+  1.4.0 起新建的 Bot 是 `data/MaiMBot-bots/<Bot ID>/plugins/`。
 
 宿主会在插件目录里生成 `config.toml`，插件默认启用，加载后立即开始采集。
 日志里出现 `内存诊断开始采集：Worker pid=...` 即表示正常运行，WebUI 的日志页也能看到。
@@ -80,7 +87,8 @@ macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，
 - 只放行本命令（推荐）：在 WebUI“麦麦设置”页的“命令管理”标签里选 `/memdiag`（插件 `shinoyuki.memdiag`，可搜 `memdiag`），
   填写“仅为此命令放行用户”，保存后立即生效，不用重启。
 
-  也可以手改 MaiBot 的 `bot_config.toml`（Docker 是 `docker-compose.yml` 所在目录下的 `docker-config/mmc/bot_config.toml`）。
+  也可以手改 MaiBot 的 `bot_config.toml`（Docker 是 `docker-compose.yml` 所在目录下的 `docker-config/mmc/bot_config.toml`，
+  1.4.0 起新建的 Bot 是 `data/MaiMBot-bots/<Bot ID>/config/bot_config.toml`）。
   `[plugin]` 段已经有一行 `command_permissions = {}`，要改写这一行，不能另起 `[plugin.command_permissions...]` 表头：
   同一个键写两次时配置解析失败，MaiBot 下次重启就起不来。
 
@@ -120,14 +128,15 @@ macOS 上用 lldb 附加插件 Runner 时，Runner 会停住直到 `continue`，
 
 | 档位 | 默认间隔 | 内容 |
 | --- | --- | --- |
-| 快速样本 `fast` | 15 秒 | Worker 的 RSS、匿名内存（Windows 为提交内存，macOS 为物理占用）、峰值、线程数（Windows 为句柄数）；按可执行文件名汇总的子进程内存（Linux 上插件 Runner、Chromium 各归一类，另计正在退出的进程数；Windows 与 macOS 按小写的文件名分桶，Runner 算在解释器名下）；Runner 自身内存；WebUI 端口上 Worker 的连接数、发送队列、疑似停止读取的连接数；一次到 Worker 的 RPC 往返耗时 |
+| 快速样本 `fast` | 15 秒 | Worker 的 RSS、匿名内存（Windows 为提交内存，macOS 为物理占用）、峰值、线程数（Windows 为句柄数）；按可执行文件名汇总的子进程内存（Linux 上插件 Runner、Chromium 各归一类，另计正在退出的进程数；Windows 与 macOS 按小写的文件名分桶，Runner 算在解释器名下）；Runner 自身内存；WebUI 端口上的连接数、发送队列、疑似停止读取的连接数（1.3.x 及更早是 Worker 的连接，1.4.0 起是宿主进程的）；一次到 Worker 的 RPC 往返耗时 |
 | 趋势记录 `trend` | 5 分钟 | 自上一条趋势记录以来快速样本的最小/最大/末值（上一轮没写成时并进这一条，`window.samples` 相应变多）；`smaps_rollup`；按映射种类分的匿名内存 `anon_maps`；glibc 线程堆估计；fd 分类与主库、元数据库的打开数；cgroup 用量、上限与 OOM 计数；逐条 WebUI 连接；关键文件与目录大小；主库轻量统计（页数、各表最大 id、新增消息数） |
 | 数据库总量 `db` | 1 小时 | 消息总数、图片按类型计数、黑话证据体量、近 30 天消息量（小时聚合表加未聚合尾部的近似值） |
 
 黑话证据体量在 SQLite 3.43 及以后是字节数；更早的 SQLite 没有 `octet_length`，记的是字符数（中文为主时明显小于字节数），
 以 `meta` 里的 `sqlite` 版本为准。
 
-每次开始采集时还会写一条 `meta`：平台、Python 与 SQLite 版本、宿主版本、插件配置（白名单只记条目数）。
+每次开始采集时还会写一条 `meta`：平台、Python 与 SQLite 版本、宿主版本、WebUI 端口与持有它的进程
+（`webui_owner`：`worker`，1.4.0 起为 `host`）、插件配置（白名单只记条目数）。
 Linux 上另有内核与 glibc 版本、cgroup、透明大页设置（`thp`，容器里看到的是宿主机内核的设置）、Worker 环境里与分配器有关的变量（`worker_env`，只取 `MALLOC_ARENA_MAX`、
 `MALLOC_TRIM_THRESHOLD_`、`MALLOC_MMAP_THRESHOLD_`、`MALLOC_TOP_PAD_`、`MALLOC_MMAP_MAX_`、`GLIBC_TUNABLES`、`PYTHONMALLOC`
 这几个键，其他变量不记）；macOS 上另有内核与系统版本。Windows 与 macOS 不读 Worker 的环境，`worker_env` 这个键不存在，
@@ -146,7 +155,7 @@ cgroup 按 `mountinfo` 找挂载点，兼容 Docker 的私有与共享 cgroup �
 - `logs/expression_review/review_logs.json`（已发布的 1.2.3 至 v1.3.18 都是这个文件）；同目录的 `review_logs.jsonl`
   留给改成追加写的版本，已发布的版本里恒为 `null`
 - `logs/memory_diagnostics/memory.jsonl`（v1.3.13 起）
-- 统计报告 HTML（`MAIBOT_STATISTICS_REPORT_PATH`，默认 `maibot_statistics.html`）
+- 统计报告 HTML（`MAIBOT_STATISTICS_REPORT_PATH`，默认 `maibot_statistics.html`；1.4.0 起宿主不再生成，记为 `null`）
 - `data/local_store.json`
 - 主库 `data/MaiBot.db` 与 A_Memorix 元数据库，以及它们的 `-wal`、`-shm`
 - `logs/app_*.log.jsonl` 与 `logs/llm_cache_stats/` 的文件数与总大小
@@ -158,7 +167,8 @@ cgroup 按 `mountinfo` 找挂载点，兼容 Docker 的私有与共享 cgroup �
 
 ### 不会做的事
 
-- 不读聊天内容、不读宿主配置文件原文、不记录完整环境变量与命令行。子进程按可执行文件名分类。
+- 不读聊天内容，不记录完整环境变量与命令行。宿主配置只经 `config.get` 读几项；1.4.0 起 WebUI 的开关与端口
+  `config.get` 读不到，直接读宿主的 `host/config.toml`，只取 `[webui]` 的 `enabled` 与 `port`。子进程按可执行文件名分类。
   Linux 上只查 Worker 及其直接子进程的命令行里有没有插件 Runner 的模块名，不取其中任何文本：
   npm 等会把含密钥的整条命令行改写进进程标题。Windows 与 macOS 不读命令行。
 - 只以只读方式打开数据库（`mode=ro` 加 `query_only`），每条 SQL 有时限，超时记为测量结果而不是重试。
@@ -169,7 +179,7 @@ cgroup 按 `mountinfo` 找挂载点，兼容 Docker 的私有与共享 cgroup �
 ## 输出文件
 
 都在 `<实例根>/data/plugins/shinoyuki.memdiag/` 下，Docker（官方 compose）在 `docker-compose.yml` 所在目录下的
-`data/MaiMBot-plugin-data/shinoyuki.memdiag/`：
+`data/MaiMBot-plugin-data/shinoyuki.memdiag/`（1.4.0 起新建的 Bot 在 `data/MaiMBot-bots/<Bot ID>/data/plugins/shinoyuki.memdiag/`）：
 
 | 文件 | 内容 |
 | --- | --- |
@@ -257,7 +267,8 @@ python -m pytest
 `tests/test_plugin.py` 需要安装 `maibot-plugin-sdk`，没有时自动跳过；其余测试只依赖标准库与 pytest。
 平台专属的测试在别的平台上跳过；macOS 上装了 Command Line Tools 时，`tests/test_darwinproc.py` 会对照系统头文件校验结构体布局。
 CI 在 Linux、Windows 与 macOS（arm64、Intel）上跑。`tests/host_smoke.sh` 用官方镜像确认插件能加载、写出真实样本、
-数据库统计能跑通、Worker 在监听 WebUI 端口，推送到 `main` 时和每周各跑一次，宿主改配置键、表结构或进程结构时靠它发现。
+数据库统计能跑通、WebUI 端口在监听（1.4.0 起看宿主进程），推送到 `main` 时和每周各跑一次，宿主改配置键、表结构或进程结构时靠它发现。
+1.4.0 起的镜像按全新部署的布局，在 `bots/` 下新建的 Bot 里加载插件。
 公开仓库连续 60 天没有活动时 GitHub 会停用定时任务，用 `gh workflow enable host-smoke.yml` 恢复。
 
 ## 许可证
